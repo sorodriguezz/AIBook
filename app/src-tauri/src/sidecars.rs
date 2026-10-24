@@ -46,21 +46,44 @@ impl Engine {
     }
 }
 
-/// Minimal blocking HTTP POST; this runs during app exit, outside any async runtime.
-fn request_shutdown(port: u16, token: &str) {
-    use std::io::Write;
+/// Minimal blocking HTTP request to the engine, outside any async runtime.
+/// Returns the status line, e.g. "HTTP/1.1 200 OK".
+fn raw_request(port: u16, token: &str, method: &str, path: &str, timeout: Duration) -> Option<String> {
+    use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
-        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-        let req = format!(
-            "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nx-folio-token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        let _ = s.write_all(req.as_bytes());
-        let mut buf = [0u8; 256];
-        let _ = std::io::Read::read(&mut s, &mut buf);
-    }
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    let _ = s.set_read_timeout(Some(timeout));
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nx-folio-token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).ok()?;
+    let mut buf = [0u8; 256];
+    let n = s.read(&mut buf).ok()?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.lines().next().map(str::to_owned)
+}
+
+fn request_shutdown(port: u16, token: &str) {
+    let _ = raw_request(port, token, "POST", "/shutdown", Duration::from_secs(5));
+}
+
+/// The engine's log (its stderr), rewritten on every start.
+fn log_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_log_dir().ok().map(|d| d.join("engine.log"))
+}
+
+fn log_tail(app: &AppHandle) -> String {
+    let text = log_path(app).and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(8)..].join("\n")
+}
+
+/// Where the engine log lives, so the UI can reveal it when something fails.
+#[tauri::command]
+pub fn engine_log(app: AppHandle) -> Option<String> {
+    log_path(&app).map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Stops the engine (and its model server) so an update can replace their files.
@@ -123,8 +146,14 @@ fn spawn(app: &AppHandle) -> Result<Running, String> {
         .env("FOLIO_TOKEN", &token)
         .env("FOLIO_DATA_DIR", &data_dir)
         .env("FOLIO_PARENT_PID", std::process::id().to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped());
+    // A GUI app on Windows has no console, so inheriting stderr would lose
+    // every engine error; keep it in a file instead.
+    let log = log_path(app).and_then(|p| {
+        std::fs::create_dir_all(p.parent()?).ok()?;
+        std::fs::File::create(p).ok()
+    });
+    cmd.stderr(log.map(Stdio::from).unwrap_or_else(Stdio::null));
     if let Some(llama) = llama_server_path(app) {
         cmd.env("FOLIO_LLAMA_SERVER", llama);
     }
@@ -146,13 +175,28 @@ fn spawn(app: &AppHandle) -> Result<Running, String> {
         }
     });
     // First start in development may need `uv` to sync dependencies.
-    match rx.recv_timeout(Duration::from_secs(180)) {
-        Ok(Some(port)) => Ok(Running { child, port, token }),
+    let port = match rx.recv_timeout(Duration::from_secs(180)) {
+        Ok(Some(port)) => port,
         _ => {
             let _ = child.kill();
-            Err("the translation engine did not start".into())
+            return Err(format!("engine_start_failed\n{}", log_tail(app)));
         }
+    };
+    // The port is announced before the server finishes starting up; only hand
+    // it to the UI once it really answers.
+    for _ in 0..120 {
+        if let Ok(Some(_)) = child.try_wait() {
+            return Err(format!("engine_start_failed\n{}", log_tail(app)));
+        }
+        if raw_request(port, &token, "GET", "/health", Duration::from_secs(2))
+            .is_some_and(|l| l.contains(" 200"))
+        {
+            return Ok(Running { child, port, token });
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
+    let _ = child.kill();
+    Err(format!("engine_start_failed\n{}", log_tail(app)))
 }
 
 #[tauri::command]

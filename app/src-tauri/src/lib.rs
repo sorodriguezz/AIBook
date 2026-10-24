@@ -37,6 +37,7 @@ pub fn run() {
             hardware::hardware_info,
             sidecars::engine_info,
             sidecars::stop_engine,
+            sidecars::engine_log,
             downloads::installed_models,
             downloads::partial_size,
             downloads::start_download,

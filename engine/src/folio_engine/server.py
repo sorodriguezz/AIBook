@@ -125,13 +125,17 @@ def _pid_alive(pid: int) -> bool:
 
 app = FastAPI(title="Folio engine", lifespan=lifespan)
 # The Tauri webview calls the engine directly; the token is the real guard.
+# WebView2 (Windows) sends a Private Network Access preflight before reaching
+# 127.0.0.1; without allow_private_network it gets a 400 and fetch fails.
 app.add_middleware(
     CORSMiddleware,
+    allow_private_network=True,
     allow_origins=["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost",
                    "http://localhost:1420"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 @app.exception_handler(UserError)

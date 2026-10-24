@@ -24,6 +24,7 @@ export const native = {
   pauseDownload: (key: string) => invoke<void>("pause_download", { key }),
   cancelDownload: (key: string) => invoke<void>("cancel_download", { key }),
   deleteModel: (file: string) => invoke<void>("delete_model", { file }),
+  engineLog: () => invoke<string | null>("engine_log"),
   onDownload: (cb: (p: DownloadProgress) => void): Promise<UnlistenFn> =>
     listen<DownloadProgress>("download-progress", (e) => cb(e.payload)),
 };
@@ -36,7 +37,9 @@ function engineInfo() {
   if (!enginePromise) {
     enginePromise = invoke<{ url: string; token: string }>("engine_info").catch((e) => {
       enginePromise = null;
-      throw e;
+      // "engine_start_failed\n<last log lines>" from the Rust side.
+      const [code, ...log] = String(e).split("\n");
+      throw new EngineError(log.join("\n") || code, 0, code === "engine_start_failed" ? code : "engine_down");
     });
   }
   return enginePromise;

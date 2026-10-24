@@ -1,7 +1,9 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
-import { Bar, Cover, LangPair } from "../components/ui";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { Bar, Button, Cover, LangPair } from "../components/ui";
+import { native } from "../lib/api";
 import { duration, relative } from "../lib/format";
 import { t, type Key } from "../lib/i18n";
 import { useApp } from "../lib/store";
@@ -10,7 +12,8 @@ import type { Job } from "../lib/types";
 const ACCEPT = /\.(pdf|epub)$/i;
 
 export default function Translate() {
-  const { jobs, go, engineError } = useApp();
+  const { jobs, go, engineError, connectEngine } = useApp();
+  const [retrying, setRetrying] = useState(false);
   const [hover, setHover] = useState(false);
 
   useEffect(() => {
@@ -74,7 +77,28 @@ export default function Translate() {
       </button>
 
       {engineError && (
-        <div className="mt-6 rounded-xl border border-ribbon/40 bg-ribbon-soft px-4 py-3 text-[13px] text-ink-2">{engineError}</div>
+        <div className="mt-6 flex items-center gap-4 rounded-xl border border-ribbon/40 bg-ribbon-soft px-4 py-3 text-[13px] text-ink-2">
+          <span className="flex-1">{engineError}</span>
+          <Button
+            variant="quiet"
+            onClick={async () => {
+              const log = await native.engineLog();
+              if (log) revealItemInDir(log).catch(() => {});
+            }}
+          >
+            {t("err.showLog")}
+          </Button>
+          <Button
+            disabled={retrying}
+            onClick={async () => {
+              setRetrying(true);
+              await connectEngine();
+              setRetrying(false);
+            }}
+          >
+            {retrying ? t("err.retrying") : t("err.retry")}
+          </Button>
+        </div>
       )}
 
       <section className="mt-14">

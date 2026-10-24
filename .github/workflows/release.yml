@@ -88,15 +88,24 @@ jobs:
           UV_PYTHON: ${{ matrix.python }}
         run: uv run --project engine --extra pdf --group build python scripts/build_engine.py
 
-      - name: Engine smoke test (frozen binary starts)
+      - name: Engine smoke test (frozen binary serves the app)
         shell: bash
+        env:
+          FOLIO_TOKEN: smoke
         run: |
           exe=app/src-tauri/resources/engine/folio-engine
           [ -f "$exe.exe" ] && exe="$exe.exe"
           "$exe" --port 0 > engine.log 2>&1 &
-          for i in $(seq 1 60); do grep -q FOLIO_ENGINE_PORT engine.log && break; sleep 1; done
+          for i in $(seq 1 90); do grep -q FOLIO_ENGINE_PORT engine.log && break; sleep 1; done
+          port=$(grep -o 'FOLIO_ENGINE_PORT=[0-9]*' engine.log | cut -d= -f2)
+          for i in $(seq 1 60); do curl -sf -H "x-folio-token: smoke" "http://127.0.0.1:$port/health" && break; sleep 1; done
           cat engine.log
-          grep -q FOLIO_ENGINE_PORT engine.log
+          curl -sf -H "x-folio-token: smoke" "http://127.0.0.1:$port/health"
+          # The preflight WebView2 sends before every call from the Windows app.
+          curl -sf -o /dev/null -X OPTIONS "http://127.0.0.1:$port/jobs" \
+            -H "Origin: http://tauri.localhost" -H "Access-Control-Request-Method: POST" \
+            -H "Access-Control-Request-Headers: x-folio-token,content-type" \
+            -H "Access-Control-Request-Private-Network: true"
 
       - working-directory: app
         run: pnpm install --frozen-lockfile

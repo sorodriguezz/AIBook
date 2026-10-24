@@ -2,6 +2,7 @@ import { documentDir, join } from "@tauri-apps/api/path";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import { create } from "zustand";
 import { engine, native, subscribeEvents, type Conversion } from "./api";
+import { friendlyError } from "./errors";
 import { estimate } from "./estimate";
 import { setUiLang, type UiLang } from "./i18n";
 import type {
@@ -72,6 +73,7 @@ interface AppState {
   refreshJobs: () => Promise<void>;
 
   engineError: string | null;
+  connectEngine: () => Promise<void>;
   init: () => Promise<void>;
 }
 
@@ -120,6 +122,16 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   engineError: null,
+  connectEngine: async () => {
+    try {
+      await get().refreshJobs();
+      await get().refreshConversions();
+      set({ engineError: null });
+    } catch (e) {
+      console.error("engine unavailable", e);
+      set({ engineError: friendlyError(e) });
+    }
+  },
   init: async () => {
     const stored: Partial<Settings> = {};
     for (const k of Object.keys(DEFAULTS) as (keyof Settings)[]) {
@@ -152,13 +164,7 @@ export const useApp = create<AppState>((set, get) => ({
         set((s) => ({ jobs: { ...s.jobs, [ev.job.id]: { ...s.jobs[ev.job.id], ...ev.job } } }));
       }
     });
-    try {
-      await get().refreshJobs();
-      await get().refreshConversions();
-      set({ engineError: null });
-    } catch (e) {
-      set({ engineError: String(e) });
-    }
+    await get().connectEngine();
   },
 }));
 
