@@ -11,7 +11,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="folio-engine")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--data-dir")
+    parser.add_argument("--selfcheck", action="store_true",
+                        help="import everything translation needs, then exit (for release builds)")
     args = parser.parse_args()
+    if args.selfcheck:
+        from .selfcheck import run
+
+        sys.exit(run())
     if args.data_dir:
         os.environ["FOLIO_DATA_DIR"] = args.data_dir
 

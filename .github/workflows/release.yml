@@ -98,6 +98,8 @@ jobs:
         run: |
           exe=app/src-tauri/resources/engine/folio-engine
           [ -f "$exe.exe" ] && exe="$exe.exe"
+          # Everything translation imports lazily must be in the frozen build.
+          "$exe" --selfcheck
           "$exe" --port 0 > engine.log 2>&1 &
           for i in $(seq 1 90); do grep -q FOLIO_ENGINE_PORT engine.log && break; sleep 1; done
           port=$(grep -o 'FOLIO_ENGINE_PORT=[0-9]*' engine.log | cut -d= -f2)

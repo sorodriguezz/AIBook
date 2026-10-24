@@ -35,6 +35,11 @@ def main() -> None:
         "--collect-all", "rapidocr",
         "--collect-all", "pymupdf",
         "--collect-all", "onnxruntime",
+        # bitstring picks its storage backend (bitarray or tibs) at import time
+        # by module name, which PyInstaller can't see.
+        "--collect-all", "bitstring",
+        "--collect-all", "bitarray",
+        "--collect-all", "tibs",
         "--collect-data", "tiktoken_ext",
         "--hidden-import", "tiktoken_ext.openai_public",
         "--collect-submodules", "uvicorn",
