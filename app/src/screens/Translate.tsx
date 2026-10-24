@@ -6,7 +6,7 @@ import { Bar, Button, Cover, LangPair } from "../components/ui";
 import { native } from "../lib/api";
 import { duration, relative } from "../lib/format";
 import { t, type Key } from "../lib/i18n";
-import { useApp } from "../lib/store";
+import { queuePosition, useApp } from "../lib/store";
 import type { Job } from "../lib/types";
 
 const ACCEPT = /\.(pdf|epub)$/i;
@@ -136,7 +136,7 @@ function JobRow({ job, onOpen, delay }: { job: Job; onOpen: () => void; delay: n
         </div>
         <div className="w-[150px] shrink-0 text-right">
           <div className={`text-[12.5px] font-medium ${job.status === "failed" ? "text-ribbon" : running ? "text-ink" : "text-ink-2"}`}>
-            {t(`status.${job.status}` as Key)}
+            {job.status === "queued" && queuePosition(job.id) ? t("job.queued", { n: queuePosition(job.id)! }) : t(`status.${job.status}` as Key)}
           </div>
           {running && progress?.eta_seconds != null && (
             <div className="tabular mt-0.5 text-[12px] text-ink-3">{duration(progress.eta_seconds)}</div>

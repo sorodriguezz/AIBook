@@ -1,5 +1,6 @@
 mod downloads;
 mod hardware;
+mod power;
 mod sidecars;
 
 use std::sync::Arc;
@@ -30,7 +31,9 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(sidecars::Engine::default())
+        .manage(power::Awake::default())
         .manage(Arc::new(downloads::Downloads::default()))
         .invoke_handler(tauri::generate_handler![
             catalog,
@@ -38,6 +41,7 @@ pub fn run() {
             sidecars::engine_info,
             sidecars::stop_engine,
             sidecars::engine_log,
+            power::set_keep_awake,
             downloads::installed_models,
             downloads::partial_size,
             downloads::start_download,

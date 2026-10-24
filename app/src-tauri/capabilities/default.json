@@ -24,6 +24,7 @@
     "opener:allow-reveal-item-in-dir",
     "opener:default",
     "updater:default",
+    "notification:default",
     "process:allow-restart"
   ]
 }

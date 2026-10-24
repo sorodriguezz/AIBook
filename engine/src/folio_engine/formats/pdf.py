@@ -8,9 +8,13 @@ treatment as EPUBs. Scanned pages are handled afterwards by the OCR path.
 """
 
 import asyncio
+import hashlib
+import inspect
 import logging
 import shutil
+import threading
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..translate import prompts
@@ -19,6 +23,7 @@ from . import ocr
 
 log = logging.getLogger(__name__)
 
+TRANSLATE_STAGE = "Translate Paragraphs"  # BabelDOC stage that calls the model
 BABELDOC_LANG = {"zh": "zh-CN", "ja": "ja", "en": "en", "es": "es", "fr": "fr", "de": "de", "it": "it"}
 
 
@@ -78,7 +83,75 @@ def _glossary(bible: dict | None, tgt: str):
     return [Glossary("folio-bible", entries)] if entries else []
 
 
-ProgressCb = Callable[[str, float], Awaitable[None]]
+ProgressCb = Callable[..., Awaitable[None]]  # (stage, fraction, current=None, total=None)
+
+
+@dataclass
+class ParagraphHooks:
+    """Per-run taps into BabelDOC's paragraph translation.
+
+    `record(source, translation, page)` sees every translated paragraph, so the
+    text can be reviewed and edited later. `replay(source)` supplies stored
+    translations instead of calling the model, which rebuilds the PDF after
+    edits (or from a half-translated book) in minutes.
+    """
+    record: Callable[[str, str, int | None], None] | None = None
+    replay: Callable[[str], str | None] | None = None
+
+
+def paragraph_id(text: str) -> str:
+    """Stable id for a BabelDOC paragraph: the same text maps to the same translation."""
+    return "pdf:" + hashlib.sha1(text.encode()).hexdigest()[:20]
+
+
+# Keyed by id(TranslationConfig): BabelDOC's classes are patched once, and each
+# run (a translation and an export may overlap) finds its own hooks.
+_HOOKS: dict[int, ParagraphHooks] = {}
+_local = threading.local()
+_installed = False
+
+
+def _install_hooks() -> None:
+    global _installed
+    if _installed:
+        return
+    from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
+    from babeldoc.format.pdf.document_il.midend.il_translator_llm_only import ILTranslatorLLMOnly
+
+    orig_post = ILTranslator.post_translate_paragraph
+    orig_batch = ILTranslatorLLMOnly.translate_paragraph
+    batch_sig = inspect.signature(orig_batch)
+
+    def post_translate_paragraph(self, paragraph, tracker, translate_input, translated_text):
+        hooks = _HOOKS.get(id(self.translation_config))
+        if hooks and hooks.record and translate_input is not None and translated_text:
+            try:
+                hooks.record(translate_input.unicode, translated_text, getattr(_local, "page", None))
+            except Exception:
+                log.exception("could not record a translated paragraph")
+        return orig_post(self, paragraph, tracker, translate_input, translated_text)
+
+    def translate_paragraph(self, *args, **kwargs):
+        bound = batch_sig.bind(self, *args, **kwargs)
+        batch = bound.arguments["batch_paragraph"]
+        pages = [p.page_number for p in batch.pages if p.page_number is not None]
+        _local.page = pages[0] if pages else None
+        hooks = _HOOKS.get(id(self.translation_config))
+        if not (hooks and hooks.replay):
+            return orig_batch(self, *args, **kwargs)
+        pbar = bound.arguments.get("pbar")
+        fonts, xfonts = bound.arguments.get("page_font_map"), bound.arguments.get("xobj_font_map")
+        for paragraph, tracker in zip(batch.paragraphs, batch.trackers):
+            text, translate_input = self.il_translator.pre_translate_paragraph(paragraph, tracker, fonts, xfonts)
+            stored = hooks.replay(text) if text is not None else None
+            if stored:  # untranslated paragraphs keep the original text
+                self.il_translator.post_translate_paragraph(paragraph, tracker, translate_input, stored)
+            if pbar:
+                pbar.advance(1)
+
+    ILTranslator.post_translate_paragraph = post_translate_paragraph
+    ILTranslatorLLMOnly.translate_paragraph = translate_paragraph
+    _installed = True
 
 
 async def translate_digital(
@@ -88,9 +161,10 @@ async def translate_digital(
     src: str,
     tgt: str,
     bible: dict | None,
-    llm_base_url: str,
+    llm_base_url: str | None,
     on_progress: ProgressCb,
     should_stop: Callable[[], bool],
+    hooks: ParagraphHooks | None = None,
 ) -> Path:
     from babeldoc.docvision.doclayout import DocLayoutModel
     from babeldoc.format.pdf import high_level
@@ -98,6 +172,10 @@ async def translate_digital(
     from babeldoc.translator.translator import OpenAITranslator
 
     high_level.init()
+    _install_hooks()
+    replaying = bool(hooks and hooks.replay)
+    # Replays never reach the model, which may not even be loaded.
+    llm_base_url = llm_base_url or "http://127.0.0.1:9"
     await on_progress("preparing", 0.0)
     layout = await asyncio.to_thread(DocLayoutModel.load_onnx)
     translator = OpenAITranslator(
@@ -123,26 +201,38 @@ async def translate_digital(
         pool_max_workers=1,  # one local model, one request at a time
         custom_system_prompt=_custom_prompt(src, tgt, bible),
         glossaries=_glossary(bible, tgt),
-        auto_extract_glossary=bible is None,
+        auto_extract_glossary=bible is None and not replaying,
         use_rich_pbar=False,
         skip_scanned_detection=False,
     )
+    result = None
+    if hooks:
+        _HOOKS[id(config)] = hooks
+    try:
+        result = await _run_babeldoc(high_level, config, on_progress, should_stop)
+    finally:
+        _HOOKS.pop(id(config), None)
+    if result is None or not result.mono_pdf_path:
+        raise RuntimeError("BabelDOC finished without producing a PDF")
+    return Path(result.mono_pdf_path)
+
+
+async def _run_babeldoc(high_level, config, on_progress: ProgressCb, should_stop: Callable[[], bool]):
     result = None
     async for event in high_level.async_translate(config):
         if should_stop():
             raise asyncio.CancelledError()
         etype = event.get("type")
         if etype in ("progress_update", "progress_end", "progress_start"):
-            await on_progress(event.get("stage", ""), float(event.get("overall_progress", 0.0)) / 100)
+            await on_progress(event.get("stage", ""), float(event.get("overall_progress", 0.0)) / 100,
+                              event.get("stage_current"), event.get("stage_total"))
         elif etype == "error":
             raise RuntimeError(str(event.get("error")))
         elif etype == "finish":
             # BabelDOC's event stream does not end on its own after "finish".
             result = event["translate_result"]
             break
-    if result is None or not result.mono_pdf_path:
-        raise RuntimeError("BabelDOC finished without producing a PDF")
-    return Path(result.mono_pdf_path)
+    return result
 
 
 async def translate_scanned_pages(

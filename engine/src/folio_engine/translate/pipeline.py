@@ -85,6 +85,8 @@ class Pipeline:
         self.emit = emit
         self.should_stop = should_stop
         self.bible: dict | None = None
+        # Glossary carried over from another book (a saga): its names are kept as-is.
+        self.seed: dict | None = None
         self.phase = ""
         self.detail = ""
 
@@ -153,7 +155,7 @@ class Pipeline:
         cp = stats.get("bible_partial")
         if cp and cp.get("windows") == n_windows:
             return cp["done"], cp["known"]
-        return 0, {"characters": [], "terms": []}
+        return 0, seeded_entries(self.seed)
 
     def _save_bible_checkpoint(self, done: int, n_windows: int, known: dict | None) -> None:
         stats = dict((self.store.get_job(self.job_id) or {}).get("stats", {}))
@@ -199,6 +201,7 @@ class Pipeline:
 
         for kind in ("characters", "terms"):
             entries = known[kind]
+            entries = [e for e in entries if not e.get("locked")]
             for start in range(0, len(entries), 40):
                 chunk = entries[start:start + 40]
                 self._check_stop()
@@ -347,6 +350,16 @@ class Pipeline:
             out.extend(res)
             context = (context + list(zip([s.plain for s in b], res)))[-CONTEXT_PAIRS:]
         return out
+
+
+def seeded_entries(seed: dict | None) -> dict:
+    """Characters and terms from an imported glossary, locked to their renderings."""
+    out: dict = {"characters": [], "terms": []}
+    for kind in out:
+        for e in (seed or {}).get(kind) or []:
+            if isinstance(e, dict) and str(e.get("source") or "").strip():
+                out[kind].append({**e, "source": str(e["source"]).strip(), "locked": bool(e.get("target"))})
+    return out
 
 
 def _script_ok(text: str, tgt: str) -> bool:

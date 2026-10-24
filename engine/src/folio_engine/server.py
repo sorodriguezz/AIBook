@@ -12,7 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from . import benchmark, jobs, langs
+from . import benchmark, editing, glossary, jobs, langs
+from .exports import Exporter
 from .conversions import Conversions
 from .library import Library, import_books
 from .errors import UserError
@@ -34,6 +35,7 @@ class State:
     runner: jobs.JobRunner
     library: Library
     conversions: Conversions
+    exporter: Exporter
 
 
 state = State()
@@ -49,6 +51,7 @@ async def lifespan(app: FastAPI):
     state.library = Library(DATA_DIR)
     state.conversions = Conversions(DATA_DIR, state.bus.publish)
     state.conversions.start()
+    state.exporter = Exporter(state.store, state.bus.publish, DATA_DIR, state.runner.publish_job)
     watchdog = asyncio.create_task(_exit_with_parent())
     unloader = asyncio.create_task(_unload_when_idle())
     yield
@@ -169,6 +172,30 @@ class CreateJob(BaseModel):
     review_glossary: bool = False
     output_dir: str | None = None
     benchmark: dict | None = None
+    glossary_seed: dict | None = None  # from glossary.read or another job's bible
+
+
+class SegmentEdit(BaseModel):
+    seg_id: str
+    text: str
+
+
+class Retranslate(BaseModel):
+    seg_id: str
+    instruction: str = ""
+
+
+class ExportReq(BaseModel):
+    partial_label: str | None = None  # set → a separate "partial" file
+
+
+class PathReq(BaseModel):
+    path: str
+
+
+class GlossaryExport(BaseModel):
+    path: str
+    bible: dict | None = None  # unsaved edits from the glossary screen
 
 
 class BenchReq(BaseModel):
@@ -203,6 +230,8 @@ async def inspect(req: InspectReq) -> dict:
 @app.post("/jobs", dependencies=[Depends(auth)])
 async def create_job(req: CreateJob) -> dict:
     langs.validate_pair(req.src, req.tgt)
+    if req.glossary_seed:
+        glossary.check_pair(req.glossary_seed, req.src, req.tgt)
     if not Path(req.path).is_file():
         raise UserError("file_not_found", "file not found", 404)
     fmt = jobs.detect_format(Path(req.path))
@@ -215,6 +244,7 @@ async def create_job(req: CreateJob) -> dict:
             "gpu_layers": req.model.gpu_layers, "honorifics": req.honorifics,
             "review_glossary": req.review_glossary, "output_dir": req.output_dir,
             "benchmark": req.benchmark, "cover": info.get("cover"),
+            "glossary_seed": req.glossary_seed,
         },
     )
     await state.runner.enqueue(job["id"])
@@ -282,10 +312,53 @@ async def put_bible(job_id: str, bible: dict) -> dict:
 
 
 @app.get("/jobs/{job_id}/segments", dependencies=[Depends(auth)])
-async def segments(job_id: str, offset: int = 0, limit: int = 200) -> list[dict]:
+async def segments(job_id: str, offset: int = 0, limit: int = 200, flagged: bool = False, q: str = "") -> dict:
     _job_or_404(job_id)
-    rows = state.store.segments(job_id)[offset:offset + limit]
-    return [{k: r[k] for k in ("seg_id", "kind", "source", "draft", "final", "flags")} for r in rows]
+    rows, total = state.store.find_segments(job_id, flagged, q.strip(), offset, limit)
+    keys = ("seg_id", "kind", "chapter", "source", "draft", "final", "flags", "edited")
+    return {"items": [{k: r[k] for k in keys} for r in rows], "total": total,
+            "counts": state.store.counts(job_id)}
+
+
+@app.put("/jobs/{job_id}/segment", dependencies=[Depends(auth)])
+async def edit_segment(job_id: str, req: SegmentEdit) -> dict:
+    job = _job_or_404(job_id)
+    row = editing.save(state.store, job, req.seg_id, req.text)
+    if not job["stats"].get("dirty"):  # the book on disk no longer matches: offer to rebuild it
+        state.store.update_job(job_id, stats={**job["stats"], "dirty": True})
+        await state.runner.publish_job(job_id)
+    return {k: row[k] for k in ("seg_id", "kind", "chapter", "source", "draft", "final", "flags", "edited")}
+
+
+@app.post("/jobs/{job_id}/segment/retranslate", dependencies=[Depends(auth)])
+async def retranslate_segment(job_id: str, req: Retranslate) -> dict:
+    job = _job_or_404(job_id)
+    current = state.store.get_job(state.runner.current) if state.runner.current else None
+    return await editing.retranslate(state.store, state.llm, current, job, req.seg_id, req.instruction)
+
+
+@app.post("/jobs/{job_id}/export", dependencies=[Depends(auth)])
+async def export(job_id: str, req: ExportReq) -> dict:
+    job = _job_or_404(job_id)
+    if not req.partial_label and job["status"] != "done":
+        raise UserError("export_unfinished", "the translation is not finished", 409)
+    return {"path": str(await state.exporter.start(job, req.partial_label))}
+
+
+@app.post("/jobs/{job_id}/glossary/export", dependencies=[Depends(auth)])
+async def export_glossary(job_id: str, req: GlossaryExport) -> dict:
+    job = _job_or_404(job_id)
+    if req.bible is not None:
+        job = {**job, "bible": req.bible}
+    if not job["bible"]:
+        raise UserError("glossary_empty", "this translation has no glossary", 409)
+    await asyncio.to_thread(glossary.export, job, Path(req.path))
+    return {"path": req.path}
+
+
+@app.post("/glossary/read", dependencies=[Depends(auth)])
+async def read_glossary(req: PathReq) -> dict:
+    return await asyncio.to_thread(glossary.read, Path(req.path))
 
 
 @app.get("/jobs/{job_id}/page")

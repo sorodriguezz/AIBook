@@ -7,6 +7,8 @@ import shutil
 import socket
 import subprocess
 import sys
+
+import httpx
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +52,10 @@ class LlamaServerManager:
         self.last_used = time.monotonic()
         self.loaded_at: float | None = None
         self.active_requests = 0
+        # Generation speed from llama-server's /metrics, for requests we don't
+        # make ourselves (BabelDOC talks to the server directly).
+        self._gen_sample: tuple[float, float, float] | None = None  # (wall, tokens, seconds)
+        self.gen_tps: float | None = None
 
     @property
     def running(self) -> bool:
@@ -82,6 +88,7 @@ class LlamaServerManager:
                 "--parallel", "1",
                 "--jinja",
                 "--no-webui",
+                "--metrics",
             ]
             if config.flash_attn:
                 args += ["-fa", "auto"]
@@ -100,11 +107,46 @@ class LlamaServerManager:
             )
             asyncio.get_running_loop().run_in_executor(None, self._drain_output, self._proc)
             self.config = config
+            self._gen_sample, self.gen_tps = None, None
             self.client = LLMClient(self.base_url, on_use=self._on_use)
             await self._wait_healthy()
             self.loaded_at = time.time()
             self.touch()
             return self.client
+
+    async def generation_rate(self) -> float | None:
+        """Recent generation tokens/s, from deltas of llama-server's counters."""
+        if not self.running or not self.base_url:
+            return self.gen_tps
+        now = time.monotonic()
+        if self._gen_sample and now - self._gen_sample[0] < 3:
+            return self.gen_tps
+        try:
+            async with httpx.AsyncClient(timeout=2) as http:
+                text = (await http.get(f"{self.base_url}/metrics")).text
+        except httpx.HTTPError:
+            return self.gen_tps
+        values = {}
+        for line in text.splitlines():
+            if line.startswith("llamacpp:"):
+                name, _, value = line.partition(" ")
+                try:
+                    values[name] = float(value)
+                except ValueError:
+                    pass
+        tokens = values.get("llamacpp:tokens_predicted_total")
+        seconds = values.get("llamacpp:tokens_predicted_seconds_total")
+        if tokens is None or seconds is None:
+            return self.gen_tps
+        if self._gen_sample:
+            d_tok, d_sec = tokens - self._gen_sample[1], seconds - self._gen_sample[2]
+            if d_tok > 0 and d_sec > 0:
+                inst = d_tok / d_sec
+                self.gen_tps = inst if self.gen_tps is None else 0.7 * self.gen_tps + 0.3 * inst
+        elif seconds > 0:
+            self.gen_tps = tokens / seconds
+        self._gen_sample = (now, tokens, seconds)
+        return self.gen_tps
 
     def touch(self) -> None:
         self.last_used = time.monotonic()

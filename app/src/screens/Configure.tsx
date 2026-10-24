@@ -3,10 +3,11 @@ import { Button, Cover, Field, FitBadge, LANGS, Segmented, Select } from "../com
 import { engine } from "../lib/api";
 import { friendlyError } from "../lib/errors";
 import { estimate, recommend } from "../lib/estimate";
+import { glossaryFromJob, glossarySources, pickGlossaryFile } from "../lib/glossary";
 import { basename, duration } from "../lib/format";
 import { t, type Key } from "../lib/i18n";
-import { installedModels, modelSpec, outputDir, useApp } from "../lib/store";
-import type { Benchmark, BookInfo, LangCode, Quality } from "../lib/types";
+import { installedModels, modelSpec, outputDir, prepareNotifications, useApp } from "../lib/store";
+import type { Benchmark, BookInfo, GlossaryFile, LangCode, Quality } from "../lib/types";
 
 /** Seconds per source token for each quality level, given measured speeds. */
 export function secondsPerToken(b: Benchmark | null, quality: Quality): number | null {
@@ -18,7 +19,7 @@ export function secondsPerToken(b: Benchmark | null, quality: Quality): number |
 }
 
 export default function Configure({ path }: { path: string }) {
-  const { go, settings, updateSettings, catalog, hardware, installed } = useApp();
+  const { go, settings, updateSettings, catalog, hardware, installed, jobs } = useApp();
   const [info, setInfo] = useState<BookInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [src, setSrcRaw] = useState<LangCode>("en");
@@ -37,6 +38,30 @@ export default function Configure({ path }: { path: string }) {
   const [honorifics, setHonorifics] = useState<"adapt" | "keep">("adapt");
   const [review, setReview] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [seed, setSeed] = useState<GlossaryFile | null>(null);
+  const [seedError, setSeedError] = useState<string | null>(null);
+  const seedSources = glossarySources(jobs, src, tgt);
+  const queued = Object.values(jobs).some((j) => j.status === "running" || j.status === "queued");
+  // A glossary only fits the language pair it was made for.
+  useEffect(() => {
+    if (seed && ((seed.src && seed.src !== src) || (seed.tgt && seed.tgt !== tgt))) setSeed(null);
+  }, [src, tgt]);
+  const chooseSeed = async (load: () => Promise<GlossaryFile | null>) => {
+    setSeedError(null);
+    try {
+      const g = await load();
+      if (!g) return;
+      if ((g.src && g.src !== src) || (g.tgt && g.tgt !== tgt)) {
+        setSeedError(t("err.glossary_pair", { src: t(`lang.${g.src ?? src}` as Key), tgt: t(`lang.${g.tgt ?? tgt}` as Key) }));
+      } else if (!g.characters?.length && !g.terms?.length) {
+        setSeedError(t("err.glossary_empty"));
+      } else {
+        setSeed(g);
+      }
+    } catch (e) {
+      setSeedError(friendlyError(e));
+    }
+  };
 
   useEffect(() => {
     engine
@@ -69,6 +94,7 @@ export default function Configure({ path }: { path: string }) {
     setBusy(true);
     try {
       await updateSettings({ lastTarget: tgt, quality });
+      prepareNotifications();
       const job = await engine.createJob({
         path,
         src,
@@ -80,6 +106,7 @@ export default function Configure({ path }: { path: string }) {
         review_glossary: review && quality !== "fast",
         output_dir: outputDir(),
         benchmark: spec.benchmark,
+        glossary_seed: seed,
       });
       useApp.setState((s) => ({ jobs: { ...s.jobs, [job.id]: job } }));
       go({ name: "job", id: job.id });
@@ -202,6 +229,33 @@ export default function Configure({ path }: { path: string }) {
             </div>
           )}
 
+          <div className="mt-7">
+            <Field label={t("cfg.glossary")} hint={t("cfg.glossary.hint")}>
+              {seed ? (
+                <div className="flex items-center gap-3 rounded-xl border border-rule bg-card px-3.5 py-2.5 text-[13px]">
+                  <span className="min-w-0 flex-1 truncate">{seed.title ?? t("gl.fileName")}</span>
+                  <span className="text-[12px] text-ink-3">
+                    {t("cfg.glossary.entries", { n: (seed.characters?.length ?? 0) + (seed.terms?.length ?? 0) })}
+                  </span>
+                  <button className="text-ink-3 hover:text-ribbon" onClick={() => setSeed(null)}>×</button>
+                </div>
+              ) : (
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button onClick={() => chooseSeed(pickGlossaryFile)}>{t("cfg.glossary.file")}</Button>
+                  {seedSources.length > 0 && (
+                    <Select value="" onChange={(id) => id && chooseSeed(() => glossaryFromJob(jobs[id]))} className="min-w-[220px] flex-1">
+                      <option value="">{t("cfg.glossary.pick")}</option>
+                      {seedSources.map((j) => (
+                        <option key={j.id} value={j.id}>{j.title}</option>
+                      ))}
+                    </Select>
+                  )}
+                </div>
+              )}
+              {seedError && <div className="mt-2 text-[12.5px] text-ribbon">{seedError}</div>}
+            </Field>
+          </div>
+
           {quality !== "fast" && (
             <label className="mt-6 flex cursor-pointer items-center gap-3 text-[13px] text-ink-2">
               <input type="checkbox" checked={review} onChange={(e) => setReview(e.target.checked)} className="h-4 w-4 accent-[var(--ribbon)]" />
@@ -210,9 +264,12 @@ export default function Configure({ path }: { path: string }) {
           )}
 
           <div className="mt-10 flex items-center justify-between border-t border-rule pt-6">
-            <div className="tabular text-[13px] text-ink-3">{eta ? t("cfg.estimate", { t: duration(eta) }) : ""}</div>
+            <div className="tabular text-[13px] text-ink-3">
+              {eta ? t("cfg.estimate", { t: duration(eta) }) : ""}
+              {queued && <div className="mt-0.5">{t("cfg.queueHint")}</div>}
+            </div>
             <Button variant="primary" disabled={!spec || !info || busy || fit === "no" || src === tgt} onClick={start}>
-              {t("cfg.start")} →
+              {queued ? t("cfg.startQueued") : t("cfg.start")} →
             </Button>
           </div>
         </div>

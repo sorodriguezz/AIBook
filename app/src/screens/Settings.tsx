@@ -76,6 +76,19 @@ export default function Settings() {
           />
         </Field>
 
+        <Field label={t("s.background")}>
+          <div className="space-y-2.5">
+            <label className="flex cursor-pointer items-center gap-3 text-[13px] text-ink-2">
+              <input type="checkbox" checked={settings.keepAwake} onChange={(e) => updateSettings({ keepAwake: e.target.checked })} className="h-4 w-4 accent-[var(--ribbon)]" />
+              {t("s.keepAwake")}
+            </label>
+            <label className="flex cursor-pointer items-center gap-3 text-[13px] text-ink-2">
+              <input type="checkbox" checked={settings.notify} onChange={(e) => updateSettings({ notify: e.target.checked })} className="h-4 w-4 accent-[var(--ribbon)]" />
+              {t("s.notify")}
+            </label>
+          </div>
+        </Field>
+
         <Field label={t("u.title")}>
           <div className="flex items-center gap-4 rounded-xl border border-rule bg-card px-4 py-3">
             <div className="flex-1 text-[13px]">

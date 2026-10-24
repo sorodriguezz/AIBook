@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS segments (
     draft TEXT,
     final TEXT,
     flags TEXT,
+    edited INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (job_id, seg_id)
 );
 CREATE INDEX IF NOT EXISTS segments_job_idx ON segments(job_id, idx);
@@ -60,6 +61,9 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        cols = {r["name"] for r in self._db.execute("PRAGMA table_info(segments)")}
+        if "edited" not in cols:  # databases from before paragraph editing
+            self._db.execute("ALTER TABLE segments ADD COLUMN edited INTEGER NOT NULL DEFAULT 0")
         self._lock = threading.Lock()
         # Jobs that were running when the app quit are resumable, not failed.
         self._db.execute("UPDATE jobs SET status='paused' WHERE status IN ('running','queued')")
@@ -127,17 +131,62 @@ class Store:
         return [dict(r) for r in self._db.execute(
             "SELECT * FROM segments WHERE job_id=? ORDER BY idx", (job_id,))]
 
+    def find_segments(self, job_id: str, flagged: bool = False, query: str = "",
+                      offset: int = 0, limit: int = 200) -> tuple[list[dict], int]:
+        """A page of segments for review, plus the total that match."""
+        where, args = "job_id=? AND kind NOT IN ('attr','meta')", [job_id]
+        if flagged:
+            where += " AND flags IS NOT NULL AND edited=0"
+        if query:
+            where += " AND (source LIKE ? OR COALESCE(final, draft, '') LIKE ?)"
+            args += [f"%{query}%"] * 2
+        total = self._db.execute(f"SELECT COUNT(*) FROM segments WHERE {where}", args).fetchone()[0]
+        rows = self._db.execute(f"SELECT * FROM segments WHERE {where} ORDER BY idx LIMIT ? OFFSET ?",
+                                [*args, limit, offset])
+        return [dict(r) for r in rows], total
+
+    def segment(self, job_id: str, seg_id: str) -> dict | None:
+        r = self._db.execute("SELECT * FROM segments WHERE job_id=? AND seg_id=?", (job_id, seg_id)).fetchone()
+        return dict(r) if r else None
+
+    def save_edit(self, job_id: str, seg_id: str, text: str) -> None:
+        """A translation chosen by the user: it wins over drafts and clears warnings."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE segments SET final=?, flags=NULL, edited=1 WHERE job_id=? AND seg_id=?",
+                (text, job_id, seg_id),
+            )
+
+    def record_paragraph(self, job_id: str, seg_id: str, page: int | None, source: str, translation: str) -> None:
+        """Store a paragraph translated outside our pipeline (BabelDOC); user edits are kept."""
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO segments (job_id, seg_id, idx, chapter, kind, source, draft)"
+                " VALUES (?, ?, (SELECT COALESCE(MAX(idx), -1) + 1 FROM segments WHERE job_id=?), ?, 'para', ?, ?)"
+                " ON CONFLICT(job_id, seg_id) DO UPDATE SET draft=excluded.draft",
+                (job_id, seg_id, job_id, page or 0, source, translation),
+            )
+
+    def counts(self, job_id: str) -> dict:
+        r = self._db.execute(
+            "SELECT COUNT(*) AS total,"
+            " SUM(CASE WHEN COALESCE(final, draft) IS NOT NULL THEN 1 ELSE 0 END) AS translated,"
+            " SUM(CASE WHEN flags IS NOT NULL AND edited=0 THEN 1 ELSE 0 END) AS flagged,"
+            " SUM(edited) AS edited"
+            " FROM segments WHERE job_id=? AND kind NOT IN ('attr','meta')", (job_id,)).fetchone()
+        return {k: r[k] or 0 for k in ("total", "translated", "flagged", "edited")}
+
     def save_draft(self, job_id: str, seg_id: str, draft: str, flags: list[str] | None = None) -> None:
         with self._lock:
             self._db.execute(
-                "UPDATE segments SET draft=?, flags=? WHERE job_id=? AND seg_id=?",
+                "UPDATE segments SET draft=?, flags=? WHERE job_id=? AND seg_id=? AND edited=0",
                 (draft, json.dumps(flags) if flags else None, job_id, seg_id),
             )
 
     def save_final(self, job_id: str, seg_id: str, final: str, flags: list[str] | None = None) -> None:
         with self._lock:
             self._db.execute(
-                "UPDATE segments SET final=?, flags=COALESCE(?, flags) WHERE job_id=? AND seg_id=?",
+                "UPDATE segments SET final=?, flags=COALESCE(?, flags) WHERE job_id=? AND seg_id=? AND edited=0",
                 (final, json.dumps(flags) if flags else None, job_id, seg_id),
             )
 

@@ -15,7 +15,7 @@ from .errors import UserError
 from .eta import EtaTracker, ProgressRateEta
 from .llm.server_manager import LlamaServerManager, ServerConfig
 from .store import Store
-from .translate.pipeline import Pipeline, Settings, Stopped
+from .translate.pipeline import Pipeline, Settings, Stopped, seeded_entries
 from .translate.segments import Segment
 from .translate import langdetect
 
@@ -109,7 +109,7 @@ class JobRunner:
         self.flags.pop(job_id, None)
         self.store.update_job(job_id, status="queued", error=None)
         await self.queue.put(job_id)
-        await self._publish_job(job_id)
+        await self.publish_job(job_id)
 
     def pause(self, job_id: str) -> None:
         self.flags[job_id] = "pause"
@@ -132,7 +132,7 @@ class JobRunner:
         if self.current == job_id and self._task and not self._task.done():
             self._task.cancel()
 
-    async def _publish_job(self, job_id: str) -> None:
+    async def publish_job(self, job_id: str) -> None:
         job = self.store.get_job(job_id)
         if job:
             job.pop("bible", None)
@@ -166,7 +166,7 @@ class JobRunner:
                 self.current = None
                 self._task = None
                 self.flags.pop(job_id, None)
-                await self._publish_job(job_id)
+                await self.publish_job(job_id)
 
     def _describe_failure(self, e: Exception) -> UserError:
         """Turn a failure into something the user can act on.
@@ -193,7 +193,7 @@ class JobRunner:
         job_id = job["id"]
         opts = job["options"]
         self.store.update_job(job_id, status="running", phase="loading_model")
-        await self._publish_job(job_id)
+        await self.publish_job(job_id)
         await self.bus.publish({"type": "progress", "job_id": job_id, "phase": "loading_model",
                                 "detail": "", "progress": job["progress"], "eta_seconds": None,
                                 "elapsed_seconds": 0})
@@ -212,6 +212,7 @@ class JobRunner:
 
         pipe = Pipeline(client, self.store, job_id, settings, eta, emit, self._should_stop(job_id))
         pipe.bible = job["bible"]
+        pipe.seed = opts.get("glossary_seed")
         out = output_path_for(job)
 
         if job["format"] == "epub":
@@ -226,7 +227,13 @@ class JobRunner:
 
     async def _maybe_bible(self, job: dict, pipe: Pipeline, segs: list[Segment]) -> None:
         """Build the book bible if needed; raises _AwaitGlossary to let the user edit it."""
-        if job["quality"] == "fast" or pipe.bible is not None:
+        if pipe.bible is not None:
+            return
+        if job["quality"] == "fast":
+            if pipe.seed:  # no analysis in this mode, but an imported glossary still applies
+                pipe.bible = {**seeded_entries(pipe.seed), "style": pipe.seed.get("style") or {},
+                              "honorifics": job["options"].get("honorifics", "adapt")}
+                self.store.update_job(job["id"], bible=pipe.bible)
             return
         bible = await pipe.build_bible(segs)
         self.store.update_job(job["id"], bible=bible)
@@ -258,6 +265,8 @@ class JobRunner:
         info = await asyncio.to_thread(pdf.read_info, path)
         scanned = info["scanned_pages"]
         stop = self._should_stop(job["id"])
+        if pipe.bible is None and job["quality"] == "fast":
+            await self._maybe_bible(job, pipe, [])
         if job["quality"] != "fast" and pipe.bible is None:
             pipe.phase, pipe.detail = "analyzing", ""
             await pipe._report()
@@ -268,31 +277,51 @@ class JobRunner:
         rate = ProgressRateEta()
         digital_share = 1 - len(scanned) / max(1, info["pages"])
 
-        async def on_progress(stage: str, frac: float, base: float = 0.0, span: float = 1.0) -> None:
+        translated = False
+
+        async def on_progress(stage: str, frac: float, current: int | None = None, total_n: int | None = None,
+                              base: float = 0.0, span: float = 1.0) -> None:
+            # BabelDOC's stage names are internal English labels; map them to our phases.
+            nonlocal translated
             total = base + span * frac
             rate.update(total)
             left = rate.seconds_left()
-            event = {"type": "progress", "job_id": job["id"],
-                     "phase": "ocr" if stage == "ocr" else "translating",
-                     "detail": stage, "progress": round(total, 4),
+            detail, kind = "", ""
+            if stage == "ocr":
+                phase = "ocr"
+            elif stage == pdf.TRANSLATE_STAGE:
+                phase, translated = "translating", True
+                if current is not None and total_n:
+                    detail, kind = f"{current}/{total_n}", "paragraphs"
+            else:
+                phase = "writing" if translated else "preparing"
+            event = {"type": "progress", "job_id": job["id"], "phase": phase,
+                     "detail": detail, "detail_kind": kind, "progress": round(total, 4),
                      "eta_seconds": round(left) if left is not None else None,
-                     "elapsed_seconds": round(time.monotonic() - rate.started_at)}
-            self.store.update_job(job["id"], phase=event["phase"], progress=event["progress"])
+                     "elapsed_seconds": round(time.monotonic() - rate.started_at),
+                     "gen_tps": await self.llm.generation_rate()}
+            if event["gen_tps"]:
+                event["gen_tps"] = round(event["gen_tps"], 1)
+            self.store.update_job(job["id"], phase=phase, progress=event["progress"])
             await self.bus.publish(event)
 
         work = self.data_dir / "work" / job["id"]
         out.parent.mkdir(parents=True, exist_ok=True)
+        def record(source: str, translation: str, page: int | None) -> None:
+            self.store.record_paragraph(job["id"], pdf.paragraph_id(source), page, source, translation)
+
         if digital_share > 0:
             produced = await pdf.translate_digital(
                 path, work / "out", work / "tmp", job["src"], job["tgt"], pipe.bible, self.llm.base_url,
-                lambda s, f: on_progress(s, f, 0.0, digital_share), stop)
+                lambda s, f, c=None, n=None: on_progress(s, f, c, n, 0.0, digital_share), stop,
+                pdf.ParagraphHooks(record=record))
             shutil.move(produced, out)
         else:
             shutil.copy(path, out)
         if scanned:
             await pdf.translate_scanned_pages(
                 out, scanned, job["src"], job["tgt"], pipe.translate_texts,
-                lambda s, f: on_progress(s, f, digital_share, 1 - digital_share), stop)
+                lambda s, f, c=None, n=None: on_progress(s, f, c, n, digital_share, 1 - digital_share), stop)
         shutil.rmtree(work, ignore_errors=True)
 
 

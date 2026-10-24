@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Benchmark,
   Bible,
+  GlossaryFile,
   BookInfo,
   CatalogModel,
   DownloadProgress,
@@ -10,6 +11,7 @@ import type {
   InstalledModel,
   Job,
   Segment,
+  SegmentPage,
 } from "./types";
 
 // ---- Rust side ---------------------------------------------------------------
@@ -25,6 +27,7 @@ export const native = {
   cancelDownload: (key: string) => invoke<void>("cancel_download", { key }),
   deleteModel: (file: string) => invoke<void>("delete_model", { file }),
   engineLog: () => invoke<string | null>("engine_log"),
+  setKeepAwake: (on: boolean) => invoke<void>("set_keep_awake", { on }),
   onDownload: (cb: (p: DownloadProgress) => void): Promise<UnlistenFn> =>
     listen<DownloadProgress>("download-progress", (e) => cb(e.payload)),
 };
@@ -141,6 +144,7 @@ export const engine = {
     review_glossary: boolean;
     output_dir: string | null;
     benchmark: Benchmark | null;
+    glossary_seed: GlossaryFile | null;
   }) => call<Job>("POST", "/jobs", req),
   pause: (id: string) => call("POST", `/jobs/${id}/pause`),
   resume: (id: string, model?: ModelSpec) => call("POST", `/jobs/${id}/resume`, model ?? null),
@@ -148,8 +152,21 @@ export const engine = {
   remove: (id: string) => call("DELETE", `/jobs/${id}`),
   bible: (id: string) => call<Bible>("GET", `/jobs/${id}/bible`),
   saveBible: (id: string, bible: Bible) => call("PUT", `/jobs/${id}/bible`, bible),
-  segments: (id: string, offset = 0, limit = 200) =>
-    call<Segment[]>("GET", `/jobs/${id}/segments?offset=${offset}&limit=${limit}`),
+  segments: (id: string, opts: { offset?: number; limit?: number; flagged?: boolean; q?: string } = {}) =>
+    call<SegmentPage>(
+      "GET",
+      `/jobs/${id}/segments?offset=${opts.offset ?? 0}&limit=${opts.limit ?? 200}` +
+        `&flagged=${!!opts.flagged}&q=${encodeURIComponent(opts.q ?? "")}`,
+    ),
+  editSegment: (id: string, seg_id: string, text: string) => call<Segment>("PUT", `/jobs/${id}/segment`, { seg_id, text }),
+  retranslate: (id: string, seg_id: string, instruction: string) =>
+    call<{ text: string; problems: string[] }>("POST", `/jobs/${id}/segment/retranslate`, { seg_id, instruction }),
+  /** Rebuild the book from stored translations; with a label, as a separate partial file. */
+  exportBook: (id: string, partialLabel?: string) =>
+    call<{ path: string }>("POST", `/jobs/${id}/export`, { partial_label: partialLabel ?? null }),
+  exportGlossary: (id: string, path: string, bible?: Bible) =>
+    call<{ path: string }>("POST", `/jobs/${id}/glossary/export`, { path, bible: bible ?? null }),
+  readGlossary: (path: string) => call<GlossaryFile>("POST", "/glossary/read", { path }),
   library: (dir: string) => call<LibraryBook[]>("GET", `/library?dir=${encodeURIComponent(dir)}`),
   libraryImport: (dir: string, paths: string[]) => call<string[]>("POST", "/library/import", { dir, paths }),
   coverUrl: async (coverId: string) => {

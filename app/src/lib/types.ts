@@ -109,6 +109,7 @@ export interface ProgressEvent {
   job_id: string;
   phase: string;
   detail: string;
+  detail_kind?: "paragraphs" | "";
   progress: number;
   eta_seconds: number | null;
   elapsed_seconds: number;
@@ -152,8 +153,41 @@ export interface Bible {
 export interface Segment {
   seg_id: string;
   kind: string;
+  chapter: number; // chapter index (EPUB) or page number (PDF)
   source: string;
   draft: string | null;
   final: string | null;
   flags: string | null;
+  edited: number;
+}
+
+export interface SegmentCounts {
+  total: number;
+  translated: number;
+  flagged: number;
+  edited: number;
+}
+
+export interface SegmentPage {
+  items: Segment[];
+  total: number;
+  counts: SegmentCounts;
+}
+
+export interface ExportEvent {
+  type: "export";
+  job_id: string;
+  state: "running" | "done" | "failed";
+  progress: number;
+  path: string;
+  error: string | null;
+  error_code: string | null;
+  at: number;
+}
+
+/** An AIBook glossary file, or another translation's bible used as one. */
+export interface GlossaryFile extends Partial<Bible> {
+  title?: string | null;
+  src?: LangCode | null;
+  tgt?: LangCode | null;
 }

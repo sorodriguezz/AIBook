@@ -1,14 +1,16 @@
 import { documentDir, join } from "@tauri-apps/api/path";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import { create } from "zustand";
 import { engine, native, subscribeEvents, type Conversion } from "./api";
 import { friendlyError } from "./errors";
 import { estimate } from "./estimate";
-import { setUiLang, type UiLang } from "./i18n";
+import { setUiLang, t, type UiLang } from "./i18n";
 import type {
   Benchmark,
   CatalogModel,
   DownloadProgress,
+  ExportEvent,
   Hardware,
   InstalledModel,
   Job,
@@ -28,6 +30,8 @@ export interface Settings {
   quality: "fast" | "high" | "best";
   chosenQuant: Record<string, string>; // model id -> quant
   benchmarks: Record<string, Benchmark>; // "<model>:<quant>" -> result
+  keepAwake: boolean; // stop the computer from sleeping while translating
+  notify: boolean; // system notification when a book finishes or needs attention
 }
 
 const DEFAULTS: Settings = {
@@ -41,6 +45,8 @@ const DEFAULTS: Settings = {
   quality: "best",
   chosenQuant: {},
   benchmarks: {},
+  keepAwake: true,
+  notify: true,
 };
 
 export type Route =
@@ -69,6 +75,7 @@ interface AppState {
   jobs: Record<string, Job>;
   progress: Record<string, ProgressEvent>;
   conversions: Record<string, Conversion>;
+  exports: Record<string, ExportEvent>; // by job id
   refreshConversions: () => Promise<void>;
   refreshJobs: () => Promise<void>;
 
@@ -112,6 +119,7 @@ export const useApp = create<AppState>((set, get) => ({
   jobs: {},
   progress: {},
   conversions: {},
+  exports: {},
   refreshConversions: async () => {
     const list = await engine.conversions();
     set({ conversions: Object.fromEntries(list.map((c) => [c.id, c])) });
@@ -161,12 +169,69 @@ export const useApp = create<AppState>((set, get) => ({
       } else if (ev.type === "conversion") {
         set((s) => ({ conversions: { ...s.conversions, [ev.conversion.id]: ev.conversion } }));
       } else if (ev.type === "job") {
+        const before = get().jobs[ev.job.id]?.status;
         set((s) => ({ jobs: { ...s.jobs, [ev.job.id]: { ...s.jobs[ev.job.id], ...ev.job } } }));
+        if (before && before !== ev.job.status) notifyJob(get().jobs[ev.job.id]);
+      } else if (ev.type === "export") {
+        set((s) => ({ exports: { ...s.exports, [ev.job_id]: ev } }));
       }
+      syncKeepAwake();
+    });
+    useApp.subscribe((s, prev) => {
+      if (s.settings.keepAwake !== prev.settings.keepAwake) syncKeepAwake();
     });
     await get().connectEngine();
+    syncKeepAwake();
   },
 }));
+
+/** Hold a no-sleep assertion while anything long is running. */
+let awake = false;
+function syncKeepAwake() {
+  const { jobs, exports, settings } = useApp.getState();
+  const busy =
+    Object.values(jobs).some((j) => j.status === "running" || j.status === "queued") ||
+    Object.values(exports).some((e) => e.state === "running");
+  const want = busy && settings.keepAwake;
+  if (want === awake) return;
+  awake = want;
+  native.setKeepAwake(want).catch((e) => console.warn("keep awake", e));
+}
+
+/** Ask once, while the user is here, so the first notification isn't lost to a prompt. */
+export async function prepareNotifications() {
+  if (!useApp.getState().settings.notify) return;
+  try {
+    if (!(await isPermissionGranted())) await requestPermission();
+  } catch (e) {
+    console.warn("notification permission", e);
+  }
+}
+
+async function notifyJob(job: Job) {
+  if (!useApp.getState().settings.notify || document.hasFocus()) return;
+  const body =
+    job.status === "done" ? t("n.done") :
+    job.status === "failed" ? t("n.failed") :
+    job.status === "awaiting_glossary" ? t("n.glossary") : null;
+  if (!body) return;
+  try {
+    let ok = await isPermissionGranted();
+    if (!ok) ok = (await requestPermission()) === "granted";
+    if (ok) sendNotification({ title: job.title ?? "AIBook", body });
+  } catch (e) {
+    console.warn("notification", e);
+  }
+}
+
+/** 1-based place in the queue of a waiting job (the engine runs them in order). */
+export function queuePosition(jobId: string): number | null {
+  const queued = Object.values(useApp.getState().jobs)
+    .filter((j) => j.status === "queued")
+    .sort((a, b) => a.updated_at - b.updated_at);
+  const i = queued.findIndex((j) => j.id === jobId);
+  return i < 0 ? null : i + 1;
+}
 
 /** Path, context and GPU split for running an installed model. */
 export function modelSpec(modelId: string) {
