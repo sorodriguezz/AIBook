@@ -32,11 +32,14 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ github.ref_name }}
     steps:
+      # The id comes straight from the create call; listing releases right
+      # after creating one can miss it, which silently disabled every upload.
       - id: draft
         run: |
-          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --title "AIBook $TAG" \
-            --notes "Descarga el instalador para tu sistema. Si ya tienes AIBook, se actualizará solo desde la app."
-          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -1)
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG" -f name="AIBook $TAG" \
+            -F draft=true -f body="Descarga el instalador para tu sistema. Si ya tienes AIBook, se actualizará solo desde la app." \
+            --jq .id)
+          [ -n "$id" ] || exit 1
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
   publish:
@@ -130,13 +133,23 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ github.ref_name }}
+      ID: ${{ needs.create-release.outputs.id }}
     steps:
       - uses: actions/checkout@v4
+      # A draft can't be looked up by tag, so everything goes through its id.
       - name: Rebuild latest.json from the signed bundles
         run: |
           mkdir sigs
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "*.sig" -D sigs
+          gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets" --paginate \
+            --jq '.[] | select(.name | endswith(".sig")) | "\(.id) \(.name)"' |
+          while read -r aid name; do
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$aid" > "sigs/$name"
+          done
+          ls sigs
           python3 scripts/updater_manifest.py "$TAG" "$GITHUB_REPOSITORY" sigs
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" latest.json --clobber
+          old=$(gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets" --paginate --jq '.[] | select(.name == "latest.json") | .id')
+          [ -z "$old" ] || gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+          gh api -X POST -H "Content-Type: application/json" --input latest.json \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$ID/assets?name=latest.json" > /dev/null
       - name: Publish
-        run: gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest
+        run: gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$ID" -F draft=false -f make_latest=true > /dev/null
