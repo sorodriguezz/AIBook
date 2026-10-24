@@ -1,0 +1,97 @@
+name: release
+
+# Push a tag like v0.2.0 (see scripts/bump_version.py) to build, sign and publish.
+# Each platform uploads its installer and updater bundle to the same GitHub
+# Release, and tauri-action merges their entries into latest.json, which the
+# app's updater reads from releases/latest.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv python install 3.12
+      - working-directory: engine
+        run: uv run pytest -q
+
+  publish:
+    needs: test-engine
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - uses: astral-sh/setup-uv@v6
+      # Native Python for the runner's architecture (ARM64 on windows-11-arm).
+      - run: uv python install 3.12
+
+      - name: Fetch llama.cpp server
+        run: uv run --no-project python scripts/fetch_llama.py --target ${{ matrix.target }}
+
+      - name: Freeze engine
+        run: uv run --project engine --extra pdf --group build python scripts/build_engine.py
+
+      - name: Engine smoke test (frozen binary starts)
+        shell: bash
+        run: |
+          exe=app/src-tauri/resources/engine/folio-engine
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          "$exe" --port 0 > engine.log 2>&1 &
+          for i in $(seq 1 60); do grep -q FOLIO_ENGINE_PORT engine.log && break; sleep 1; done
+          cat engine.log
+          grep -q FOLIO_ENGINE_PORT engine.log
+
+      - working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: Build, sign and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signature (ed25519), not OS code signing.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: app
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.json
+          tagName: ${{ github.ref_name }}
+          releaseName: AIBook ${{ github.ref_name }}
+          releaseBody: Descarga el instalador para tu sistema. Si ya tienes AIBook, se actualizará solo desde la app.
+          # Published (not draft) so releases/latest/download/latest.json resolves.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true

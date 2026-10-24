@@ -1,0 +1,189 @@
+@import "tailwindcss";
+@import "@fontsource-variable/fraunces";
+@import "@fontsource-variable/newsreader";
+@import "@fontsource/instrument-sans/400.css";
+@import "@fontsource/instrument-sans/500.css";
+@import "@fontsource/instrument-sans/600.css";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Paper, ink and a single vermilion ribbon. */
+:root {
+  --paper: #f5f0e6;
+  --paper-2: #ede6d8;
+  --card: #fbf8f2;
+  --ink: #1d1a15;
+  --ink-2: #57514a;
+  --ink-3: #8f877c;
+  --rule: #dcd3c3;
+  --ribbon: #c4402b;
+  --ribbon-soft: #c4402b1a;
+  --moss: #4f6b3c;
+  --amber: #b07a1f;
+  --grain-opacity: 0.35;
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --paper: #15140f;
+  --paper-2: #1d1b16;
+  --card: #1b1a15;
+  --ink: #ede5d6;
+  --ink-2: #b4ab9c;
+  --ink-3: #7b7468;
+  --rule: #2f2c25;
+  --ribbon: #e2604a;
+  --ribbon-soft: #e2604a22;
+  --moss: #8db070;
+  --amber: #d9a54a;
+  --grain-opacity: 0.18;
+  color-scheme: dark;
+}
+
+@theme {
+  --font-display: "Fraunces Variable", Georgia, serif;
+  --font-read: "Newsreader Variable", Georgia, serif;
+  --font-sans: "Instrument Sans", ui-sans-serif, sans-serif;
+  --color-paper: var(--paper);
+  --color-paper-2: var(--paper-2);
+  --color-card: var(--card);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-rule: var(--rule);
+  --color-ribbon: var(--ribbon);
+  --color-ribbon-soft: var(--ribbon-soft);
+  --color-moss: var(--moss);
+  --color-amber: var(--amber);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+/* Paper grain: an inline SVG turbulence, fixed so it does not scroll. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 100;
+  opacity: var(--grain-opacity);
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.45  0 0 0 0 0.4  0 0 0 0 0.33  0 0 0 0.09 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+}
+[data-theme="dark"] body::before {
+  mix-blend-mode: screen;
+}
+
+.display {
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 96, "SOFT" 50;
+  letter-spacing: -0.02em;
+}
+
+.reading {
+  font-family: var(--font-read);
+  font-size: 15.5px;
+  line-height: 1.65;
+  user-select: text;
+}
+
+.eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  font-weight: 500;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* In the base layer so Tailwind utilities (e.g. text-paper) can override it. */
+@layer base {
+  input,
+  select,
+  textarea,
+  button {
+    font: inherit;
+    color: inherit;
+  }
+}
+
+::selection {
+  background: var(--ribbon-soft);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--rule);
+  border-radius: 10px;
+  border: 3px solid var(--paper);
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.breathe {
+  animation: breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: -200% 0;
+  }
+  to {
+    background-position: 200% 0;
+  }
+}
+.shimmer {
+  background-image: linear-gradient(90deg, transparent, color-mix(in srgb, var(--card) 60%, transparent), transparent);
+  background-size: 200% 100%;
+  animation: shimmer 2.2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise,
+  .breathe,
+  .shimmer {
+    animation: none;
+  }
+}

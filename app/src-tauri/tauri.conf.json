@@ -1,0 +1,67 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AIBook",
+  "version": "0.1.0",
+  "identifier": "com.sorodriguezz.aibook",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "AIBook",
+        "width": 1180,
+        "height": 800,
+        "minWidth": 940,
+        "minHeight": 640,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/llama/": "resources/llama/",
+      "../../catalog/models.json": "resources/models.json"
+    },
+    "category": "Productivity",
+    "shortDescription": "Traduce libros PDF y EPUB con IA local",
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM4NUQ1OTg5NjY2QUQ5OUYKUldTZjJXcG1pVmxkT0xRY1J6dHBJS292dUJ4ZWJXSmx5YjBRTldHbVZFU3ZWRzRhb1podk0wQjMK",
+      "endpoints": [
+        "https://github.com/sorodriguezz/AIBook/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+node_modules/
+app/dist/
+app/src-tauri/target/
+app/src-tauri/gen/
+app/src-tauri/resources/llama/
+app/src-tauri/resources/engine/
+engine/.venv/
+build/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+*.gguf

@@ -1,0 +1,55 @@
+[package]
+name = "aibook"
+version = "0.1.0"
+description = "AIBook — traductor de libros con IA local"
+authors = ["sorodriguezz"]
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-dialog = "2"
+tauri-plugin-store = "2"
+tokio = { version = "1.54.1", features = ["full"] }
+sha2 = "0.11.1"
+hex = "0.4.3"
+sysinfo = "0.39.6"
+futures-util = "0.3.34"
+uuid = { version = "1.29.0", features = ["v4"] }
+log = "0.4.34"
+reqwest = { version = "0.13.5", default-features = false, features = ["stream", "native-tls", "http2"] }
+tauri-plugin-process = "2"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+# Proc-macros and build scripts are host dylibs loaded by rustc; stripping their
+# symbols makes rustc fail with "can't find crate for `tauri_macros`".
+[profile.release.build-override]
+strip = false
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = ["Win32_Graphics_Dxgi", "Win32_Foundation"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
