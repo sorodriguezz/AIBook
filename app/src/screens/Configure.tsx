@@ -7,7 +7,7 @@ import { glossaryFromJob, glossarySources, pickGlossaryFile } from "../lib/gloss
 import { basename, duration } from "../lib/format";
 import { t, type Key } from "../lib/i18n";
 import { installedModels, modelSpec, outputDir, prepareNotifications, useApp } from "../lib/store";
-import type { Benchmark, BookInfo, GlossaryFile, LangCode, Quality } from "../lib/types";
+import type { Benchmark, BookInfo, BookType, GlossaryFile, LangCode, Quality } from "../lib/types";
 
 /** Seconds per source token for each quality level, given measured speeds. */
 export function secondsPerToken(b: Benchmark | null, quality: Quality): number | null {
@@ -37,6 +37,7 @@ export default function Configure({ path }: { path: string }) {
   const [quality, setQuality] = useState<Quality>(settings.quality);
   const [honorifics, setHonorifics] = useState<"adapt" | "keep">("adapt");
   const [review, setReview] = useState(false);
+  const [bookType, setBookType] = useState<BookType>("literary");
   const [busy, setBusy] = useState(false);
   const [seed, setSeed] = useState<GlossaryFile | null>(null);
   const [seedError, setSeedError] = useState<string | null>(null);
@@ -68,6 +69,7 @@ export default function Configure({ path }: { path: string }) {
       .inspect(path)
       .then((i) => {
         setInfo(i);
+        if (i.book_type) setBookType(i.book_type);
         if (i.detected_language) {
           setSrcRaw(i.detected_language);
           if (i.detected_language === tgt) setTgtRaw(i.detected_language === "es" ? "en" : "es");
@@ -107,6 +109,7 @@ export default function Configure({ path }: { path: string }) {
         output_dir: outputDir(),
         benchmark: spec.benchmark,
         glossary_seed: seed,
+        book_type: bookType,
       });
       useApp.setState((s) => ({ jobs: { ...s.jobs, [job.id]: job } }));
       go({ name: "job", id: job.id });
@@ -198,6 +201,25 @@ export default function Configure({ path }: { path: string }) {
                 </div>
               )}
             </Field>
+          </div>
+
+          <div className="mt-7">
+            <Field label={t("cfg.bookType")}>
+              <Segmented<BookType>
+                value={bookType}
+                onChange={setBookType}
+                options={(["literary", "technical"] as BookType[]).map((b) => ({
+                  value: b,
+                  label: t(`cfg.bookType.${b}` as Key),
+                  hint: t(`cfg.bookType.${b}.hint` as Key),
+                }))}
+              />
+            </Field>
+            {info?.book_type && (
+              <div className={`mt-2.5 text-[12.5px] ${bookType !== info.book_type ? "text-amber" : "text-ink-3"}`}>
+                {t("cfg.bookType.detected", { t: t(`cfg.bookType.${info.book_type}` as Key).toLowerCase() })}
+              </div>
+            )}
           </div>
 
           <div className="mt-7">

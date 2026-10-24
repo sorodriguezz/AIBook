@@ -26,6 +26,7 @@ export default function Glossary({ job }: { job: Job }) {
   if (!bible) return <div className="breathe mt-12 text-ink-3">…</div>;
 
   const update = (patch: Partial<Bible>) => setBible({ ...bible, ...patch });
+  const technical = job.options.book_type === "technical";
   const save = async () => {
     setSaving(true);
     await engine.saveBible(job.id, bible);
@@ -68,8 +69,8 @@ export default function Glossary({ job }: { job: Job }) {
 
   return (
     <section className="rise mt-12">
-      <h2 className="display text-[26px] font-light">{t("gl.title")}</h2>
-      <p className="mt-1 text-[13.5px] text-ink-2">{t("gl.subtitle")}</p>
+      <h2 className="display text-[26px] font-light">{technical ? t("gl.title.technical") : t("gl.title")}</h2>
+      <p className="mt-1 text-[13.5px] text-ink-2">{technical ? t("gl.subtitle.technical") : t("gl.subtitle")}</p>
 
       <div className="mt-5 flex flex-wrap items-center gap-2">
         <Button onClick={() => importFrom(pickGlossaryFile)}>{t("gl.import")}</Button>
@@ -100,18 +101,22 @@ export default function Glossary({ job }: { job: Job }) {
         ))}
       </div>
 
+      {/* Technical books have terminology, not characters (unless an import brought some). */}
+      {(!technical || bible.characters.length > 0) && (
+        <Table
+          title={t("gl.characters")}
+          rows={bible.characters}
+          extra={{ key: "voice", label: t("gl.voice") }}
+          onChange={(characters) => update({ characters })}
+        />
+      )}
       <Table
-        title={t("gl.characters")}
-        rows={bible.characters}
-        extra={{ key: "voice", label: t("gl.voice") }}
-        onChange={(characters) => update({ characters })}
-      />
-      <Table
-        title={t("gl.terms")}
+        title={technical ? t("gl.terms.technical") : t("gl.terms")}
         rows={bible.terms}
         extra={{ key: "note", label: t("gl.note") }}
         onChange={(terms) => update({ terms })}
       />
+      {technical && <p className="mt-3 text-[12.5px] text-ink-3">{t("gl.technicalHint")}</p>}
 
       <div className="sticky bottom-0 mt-10 flex justify-end border-t border-rule bg-paper/90 py-5 backdrop-blur">
         <Button variant="primary" disabled={saving} onClick={save}>{t("gl.continue")} →</Button>

@@ -69,6 +69,7 @@ export default function JobView({ id }: { id: string }) {
           <div className="mt-2 flex items-center gap-3 text-[12.5px] text-ink-3">
             <LangPair src={job.src} tgt={job.tgt} />
             <span>· {t(`cfg.quality.${job.quality}` as Key)}</span>
+            {job.options.book_type === "technical" && <span>· {t("cfg.bookType.technical")}</span>}
             <span>· {useApp.getState().catalog.find((m) => m.id === job.model_id)?.name ?? job.model_id}</span>
           </div>
         </div>

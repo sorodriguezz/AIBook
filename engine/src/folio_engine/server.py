@@ -173,6 +173,7 @@ class CreateJob(BaseModel):
     output_dir: str | None = None
     benchmark: dict | None = None
     glossary_seed: dict | None = None  # from glossary.read or another job's bible
+    book_type: Literal["literary", "technical"] = "literary"
 
 
 class SegmentEdit(BaseModel):
@@ -244,7 +245,7 @@ async def create_job(req: CreateJob) -> dict:
             "gpu_layers": req.model.gpu_layers, "honorifics": req.honorifics,
             "review_glossary": req.review_glossary, "output_dir": req.output_dir,
             "benchmark": req.benchmark, "cover": info.get("cover"),
-            "glossary_seed": req.glossary_seed,
+            "glossary_seed": req.glossary_seed, "book_type": req.book_type,
         },
     )
     await state.runner.enqueue(job["id"])

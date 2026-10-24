@@ -91,7 +91,8 @@ class Exporter:
 
         produced = await pdf.translate_digital(
             Path(job["input_path"]), work / "out", work / "tmp", job["src"], job["tgt"], job["bible"], None,
-            on_progress, lambda: False, pdf.ParagraphHooks(replay=by_source.get))
+            on_progress, lambda: False, pdf.ParagraphHooks(replay=by_source.get),
+            job["options"].get("book_type", "literary"))
         previous = job.get("output_path")
         scanned = (await asyncio.to_thread(pdf.read_info, Path(job["input_path"])))["scanned_pages"]
         if scanned and previous and Path(previous).exists():
@@ -105,7 +106,7 @@ class Exporter:
 def _write_epub(job: dict, translations: dict[str, str], out: Path) -> None:
     from .formats.epub import EpubBook
 
-    book = EpubBook(Path(job["input_path"]))
+    book = EpubBook(Path(job["input_path"]), technical=job["options"].get("book_type") == "technical")
     book.extract()
     book.apply(translations, job["tgt"])
     tmp = out.with_suffix(".tmp.epub")

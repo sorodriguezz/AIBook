@@ -15,7 +15,7 @@ from pathlib import Path
 from lxml import etree
 
 from ..langs import is_cjk
-from ..translate import placeholders
+from ..translate import booktype, placeholders
 from ..translate.segments import Segment
 
 XHTML = "http://www.w3.org/1999/xhtml"
@@ -55,8 +55,10 @@ class Document:
 class EpubBook:
     """Holds the parsed book between extraction and rebuild."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, technical: bool = False) -> None:
         self.path = path
+        # Technical books: elements styled as code by the publisher are left untouched.
+        self.technical = technical
         self.zip = zipfile.ZipFile(path)
         container = etree.fromstring(self.zip.read("META-INF/container.xml"))
         self.opf_path = container.find(".//{*}rootfile").get("full-path")
@@ -167,7 +169,7 @@ class EpubBook:
         while stack:
             el = stack.pop()
             name = _local(el.tag)
-            if name in SKIP_TAGS or not isinstance(el.tag, str):
+            if not isinstance(el.tag, str) or _untranslatable(el, self.technical):
                 continue
             if name == "head":
                 continue
@@ -193,7 +195,7 @@ class EpubBook:
                 self._slots[sid] = ("loose", node, where)
             return
         name = _local(el.tag)
-        source, mapping = serialize_inline(el, preserve_ws=name == "pre")
+        source, mapping = serialize_inline(el, preserve_ws=name == "pre", technical=self.technical)
         if not placeholders.has_text(source):
             return
         kind = "heading" if name in HEADING_TAGS else "cell" if name in CELL_TAGS else \
@@ -279,7 +281,13 @@ class EpubBook:
 
 # ---- inline serialization ----------------------------------------------------
 
-def serialize_inline(el, preserve_ws: bool = False) -> tuple[str, dict[str, etree._Element]]:
+def _untranslatable(el, technical: bool) -> bool:
+    if _local(el.tag) in SKIP_TAGS:
+        return True
+    return technical and bool(booktype.CODE_CLASS_RE.search(el.get("class") or ""))
+
+
+def serialize_inline(el, preserve_ws: bool = False, technical: bool = False) -> tuple[str, dict[str, etree._Element]]:
     """Turn a block's content into text with ⟦n⟧ markers for inline children."""
     mapping: dict[str, etree._Element] = {}
     counter = [0]
@@ -298,7 +306,7 @@ def serialize_inline(el, preserve_ws: bool = False) -> tuple[str, dict[str, etre
                     for c in child
                 )
                 parts.append(base)
-            elif name in SKIP_TAGS or name in VOID_INLINE or (len(child) == 0 and not (child.text or "").strip()):
+            elif _untranslatable(child, technical) or name in VOID_INLINE or (len(child) == 0 and not (child.text or "").strip()):
                 # Line breaks, images, empty anchors and untranslatable content (code,
                 # math) travel as opaque void markers and are restored verbatim.
                 counter[0] += 1
@@ -391,9 +399,17 @@ def _serialize(tree: etree._ElementTree) -> bytes:
 def read_info(path: Path) -> dict:
     book = EpubBook(path)
     segs = book.extract()
-    sample = " ".join(s.plain for s in segs if s.kind == "para")[:4000]
+    paras = [s.plain for s in segs if s.kind == "para"]
+    sample = " ".join(paras)[:4000]
     from ..translate.segments import estimate_tokens
 
+    # Paragraphs from across the book, not just the front matter.
+    step = max(1, len(paras) // 120)
+    spread = "\n".join(paras[::step])[:30000]
+    code_blocks = sum(1 for d in book.docs.values() for el in d.tree.iter()
+                      if isinstance(el.tag, str) and (_local(el.tag) in ("pre", "code")
+                                                      or booktype.CODE_CLASS_RE.search(el.get("class") or "")))
     return {"title": book.title, "language": book.language, "sample": sample,
             "segments": len(segs), "chapters": len(book.spine_order),
-            "tokens": sum(estimate_tokens(s.source) for s in segs)}
+            "tokens": sum(estimate_tokens(s.source) for s in segs),
+            "book_type": booktype.classify(spread, code_blocks=code_blocks)}

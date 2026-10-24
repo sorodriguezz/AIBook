@@ -41,7 +41,26 @@ def read_info(path: Path) -> dict:
             tokens += int(tokens / digital * len(scanned)) if tokens else 450 * len(scanned)
         title = (doc.metadata or {}).get("title") or path.stem
         return {"title": title, "pages": doc.page_count, "scanned_pages": scanned,
-                "sample": " ".join(texts)[:4000], "language": None, "tokens": tokens}
+                "sample": " ".join(texts)[:4000], "language": None, "tokens": tokens,
+                "book_type": _book_type(doc, texts)}
+
+
+def _book_type(doc, texts: list[str]) -> str:
+    """Classify from ~30 pages spread through the book, counting text set in code fonts."""
+    from ..translate import booktype
+
+    n = doc.page_count
+    pages = sorted({int(i * n / 30) for i in range(min(30, n))})
+    mono = total = 0
+    for i in pages:
+        for block in doc[i].get_text("dict")["blocks"]:
+            for line in block.get("lines", []):
+                for span in line["spans"]:
+                    k = len(span["text"].strip())
+                    total += k
+                    if booktype.MONO_FONT_RE.search(span["font"]):
+                        mono += k
+    return booktype.classify("\n".join(texts[i] for i in pages), mono / max(1, total))
 
 
 def bible_segments(path: Path, src: str, scanned: list[int]) -> list[Segment]:
@@ -63,11 +82,48 @@ def bible_segments(path: Path, src: str, scanned: list[int]) -> list[Segment]:
     return segs
 
 
-def _custom_prompt(src: str, tgt: str, bible: dict | None) -> str:
+# BabelDOC's own pattern for formula fonts (left untranslated), plus the
+# monospace fonts technical books set code in. Only used in technical mode.
+CODE_FONT_PATTERN = (
+    r"(CM[^RB]|(MS|XY|MT|BL|RM|EU|LA|RS)[A-Z]|LINE|LCIRCLE|TeX-|rsfs|txsy|wasy|stmary|.*Mono|.*Code"
+    r"|.*Sym|.*Math|AdvP4C4E74|AdvPSSym|AdvP4C4E59"
+    r"|.*Courier|.*Consola|.*Menlo|.*Monaco|.*Inconsolata|.*Lucida ?Console|.*LucidaSansTypewriter"
+    r"|.*Typewriter|.*Andale|.*LetterGothic|.*FiraCode|.*Cousine|.*Hack-|.*OCR-?A|.*CMTT|.*SFMono)"
+)
+
+
+def _code_font_pattern(path: Path) -> str | None:
+    """CODE_FONT_PATTERN, unless the body text itself is set in such a font.
+
+    Protected fonts are left untranslated, so a book typeset entirely in, say,
+    Courier would otherwise come out unchanged.
+    """
+    import re
+
+    import pymupdf
+
+    code = total = 0
+    with pymupdf.open(path) as doc:
+        n = doc.page_count
+        for i in sorted({int(k * n / 20) for k in range(min(20, n))}):
+            for block in doc[i].get_text("dict")["blocks"]:
+                for line in block.get("lines", []):
+                    for span in line["spans"]:
+                        k = len(span["text"].strip())
+                        total += k
+                        if re.match(CODE_FONT_PATTERN, span["font"].split("+")[-1]):
+                            code += k
+    if total and code / total > 0.5:
+        log.info("most text is in a code-like font; not protecting code fonts")
+        return None
+    return CODE_FONT_PATTERN
+
+
+def _custom_prompt(src: str, tgt: str, bible: dict | None, book_type: str = "literary") -> str:
     chars = (bible or {}).get("characters", [])[:60]
     terms = (bible or {}).get("terms", [])[:80]
     honor = (bible or {}).get("honorifics", "adapt")
-    base = prompts.translator_system(src, tgt, bible, chars, terms, honor)
+    base = prompts.translator_system(src, tgt, bible, chars, terms, honor, book_type)
     # BabelDOC uses its own markup and output format; drop our marker/format rules.
     return "\n".join(l for l in base.splitlines() if "⟦" not in l and "requested format" not in l)
 
@@ -165,6 +221,7 @@ async def translate_digital(
     on_progress: ProgressCb,
     should_stop: Callable[[], bool],
     hooks: ParagraphHooks | None = None,
+    book_type: str = "literary",
 ) -> Path:
     from babeldoc.docvision.doclayout import DocLayoutModel
     from babeldoc.format.pdf import high_level
@@ -199,7 +256,8 @@ async def translate_digital(
         watermark_output_mode=WatermarkOutputMode.NoWatermark,
         qps=1,
         pool_max_workers=1,  # one local model, one request at a time
-        custom_system_prompt=_custom_prompt(src, tgt, bible),
+        custom_system_prompt=_custom_prompt(src, tgt, bible, book_type),
+        formular_font_pattern=await asyncio.to_thread(_code_font_pattern, path) if book_type == "technical" else None,
         glossaries=_glossary(bible, tgt),
         auto_extract_glossary=bible is None and not replaying,
         use_rich_pbar=False,

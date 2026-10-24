@@ -205,7 +205,8 @@ class JobRunner:
         eta = EtaTracker()
         bench = opts.get("benchmark") or {}
         eta.seed(bench.get("prompt_tps"), bench.get("gen_tps"))
-        settings = Settings(job["src"], job["tgt"], job["quality"], opts.get("honorifics", "adapt"))
+        settings = Settings(job["src"], job["tgt"], job["quality"], opts.get("honorifics", "adapt"),
+                        opts.get("book_type", "literary"))
 
         async def emit(ev: dict) -> None:
             await self.bus.publish(ev)
@@ -245,7 +246,7 @@ class JobRunner:
     async def _run_epub(self, job: dict, pipe: Pipeline, out: Path) -> None:
         from .formats.epub import EpubBook
 
-        book = EpubBook(Path(job["input_path"]))
+        book = EpubBook(Path(job["input_path"]), technical=job["options"].get("book_type") == "technical")
         segs = book.extract()
         if not self.store.has_segments(job["id"]):
             self.store.add_segments(job["id"], segs)
@@ -314,7 +315,7 @@ class JobRunner:
             produced = await pdf.translate_digital(
                 path, work / "out", work / "tmp", job["src"], job["tgt"], pipe.bible, self.llm.base_url,
                 lambda s, f, c=None, n=None: on_progress(s, f, c, n, 0.0, digital_share), stop,
-                pdf.ParagraphHooks(record=record))
+                pdf.ParagraphHooks(record=record), job["options"].get("book_type", "literary"))
             shutil.move(produced, out)
         else:
             shutil.copy(path, out)

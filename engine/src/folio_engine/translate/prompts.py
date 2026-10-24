@@ -72,8 +72,11 @@ def glossary_block(chars: list[dict], terms: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def translator_system(src: str, tgt: str, bible: dict | None, chars, terms, honorifics: str) -> str:
+def translator_system(src: str, tgt: str, bible: dict | None, chars, terms, honorifics: str,
+                      book_type: str = "literary") -> str:
     s, t = LANGUAGES[src], LANGUAGES[tgt]
+    if book_type == "technical":
+        return _technical_system(src, tgt, bible, terms)
     rules = [
         f"You are an award-winning literary translator from {s.name} into {t.name}, translating a "
         f"published book for {t.name}-speaking readers. Your translation must read as if it had "
@@ -102,6 +105,39 @@ def translator_system(src: str, tgt: str, bible: dict | None, chars, terms, hono
     if style:
         rules += ["", "About this book:", style]
     gl = glossary_block(chars, terms)
+    if gl:
+        rules += ["", gl]
+    return "\n".join(rules)
+
+
+def _technical_system(src: str, tgt: str, bible: dict | None, terms) -> str:
+    s, t = LANGUAGES[src], LANGUAGES[tgt]
+    rules = [
+        f"You are an expert technical translator from {s.name} into {t.name}, translating a published "
+        f"technical or non-fiction book (software, engineering, science, business) for {t.name}-speaking "
+        "professionals. The translation must be exact and read like a well-edited technical book "
+        f"written in {t.name}.",
+        "",
+        "Principles:",
+        "1. Accuracy first: keep the precise meaning, conditions, numbers, units and caveats. Do not "
+        "simplify, summarize, explain or add anything.",
+        f"2. Terminology: use the terms {t.name}-speaking practitioners actually use. Many stay in English "
+        "(e.g. framework, commit, pod, deployment, backend, machine learning) when that is the established "
+        "usage; otherwise use the standard technical translation. Follow the glossary exactly and use the "
+        "same term for the same concept throughout the book.",
+        "3. Never translate code, shell commands, command-line options, function/class/variable names, "
+        "file names and paths, URLs, configuration keys, API fields, log or error messages quoted from "
+        "software, or product names. Copy them exactly as written.",
+        f"4. Write clear, direct, natural {t.name}; avoid calques and false friends. Keep the author's way "
+        f"of addressing the reader using the usual convention of {t.name} technical books.",
+        "5. Keep lists, headings and captions short and parallel, as in the original.",
+        f"6. {MARKER_RULES}",
+        "7. Output only the translation in the requested format — no notes, no explanations.",
+    ]
+    style = style_block(bible)
+    if style:
+        rules += ["", "About this book:", style]
+    gl = glossary_block([], terms)
     if gl:
         rules += ["", gl]
     return "\n".join(rules)
@@ -139,9 +175,21 @@ def translate_user(
     return "\n".join(parts)
 
 
-def review_system(src: str, tgt: str, bible: dict | None, chars, terms, honorifics: str) -> str:
+def review_system(src: str, tgt: str, bible: dict | None, chars, terms, honorifics: str,
+                  book_type: str = "literary") -> str:
     s, t = LANGUAGES[src], LANGUAGES[tgt]
-    base = translator_system(src, tgt, bible, chars, terms, honorifics)
+    base = translator_system(src, tgt, bible, chars, terms, honorifics, book_type)
+    if book_type == "technical":
+        return base + "\n\n" + "\n".join([
+            f"You are now acting as the technical editor reviewing a draft {t.name} translation against "
+            f"the {s.name} original. Check each segment for:",
+            "- omissions, additions, or changes in meaning, numbers, units or conditions;",
+            "- code, commands, identifiers, paths or product names that were translated or altered;",
+            "- inconsistent or non-standard terminology; glossary violations;",
+            "- calques, false friends and unnatural phrasing.",
+            "Return the final, corrected translation for every segment. If a segment is already "
+            "correct, return it unchanged. Keep all ⟦…⟧ markers.",
+        ])
     return base + "\n\n" + "\n".join([
         f"You are now acting as the senior editor reviewing a draft {t.name} translation against "
         f"the {s.name} original. Check each segment for:",
@@ -187,8 +235,33 @@ BIBLE_SCHEMA_HINT = {
 }
 
 
-def bible_extract_messages(src: str, excerpt: str, known: dict) -> list[dict]:
+TECH_SCHEMA_HINT = {
+    "terms": [
+        {"source": "technical term, concept, acronym, tool or product name as written",
+         "note": "what it means in this book"}
+    ],
+}
+
+
+def bible_extract_messages(src: str, excerpt: str, known: dict, book_type: str = "literary") -> list[dict]:
     s = LANGUAGES[src]
+    if book_type == "technical":
+        known_terms = [t["source"] for t in known.get("terms", [])][:150]
+        return [
+            {"role": "system", "content": (
+                f"You analyze {s.name} technical books to prepare a terminology glossary for translators. "
+                "Respond with a single JSON object only."
+            )},
+            {"role": "user", "content": (
+                "From the excerpt below, list NEW technical terms, concepts, acronyms, tools and product "
+                "names that a translator must render consistently across the book. Skip everyday words "
+                "and code identifiers.\n"
+                f"Already known terms: {json.dumps(known_terms, ensure_ascii=False)}\n"
+                f"JSON shape: {json.dumps(TECH_SCHEMA_HINT, ensure_ascii=False)}\n"
+                "Use exact spellings from the text.\n\n"
+                f"Excerpt:\n{excerpt}"
+            )},
+        ]
     known_names = [c["source"] for c in known.get("characters", [])][:80]
     known_terms = [t["source"] for t in known.get("terms", [])][:120]
     return [
@@ -210,8 +283,19 @@ def bible_extract_messages(src: str, excerpt: str, known: dict) -> list[dict]:
     ]
 
 
-def bible_style_messages(src: str, tgt: str, sample: str, known: dict) -> list[dict]:
+def bible_style_messages(src: str, tgt: str, sample: str, known: dict, book_type: str = "literary") -> list[dict]:
     s, t = LANGUAGES[src], LANGUAGES[tgt]
+    if book_type == "technical":
+        return [
+            {"role": "system", "content": "You are a technical editor. Respond with a single JSON object only."},
+            {"role": "user", "content": (
+                f"Characterize this {s.name} book for a translator working into {t.name}. "
+                "Return JSON: {\"genre\": str (subject area), \"tone\": str, \"narration\": str (how the "
+                "author addresses the reader), \"register\": str (intended audience and level), \"notes\": "
+                "str (conventions to keep: code listings, notation, units, recurring examples)}. Write the "
+                f"values in English, concisely.\n\nOpening of the book:\n{sample}"
+            )},
+        ]
     chars = [c["source"] for c in known.get("characters", [])][:30]
     return [
         {"role": "system", "content": "You are a literary editor. Respond with a single JSON object only."},
@@ -225,8 +309,21 @@ def bible_style_messages(src: str, tgt: str, sample: str, known: dict) -> list[d
     ]
 
 
-def bible_render_messages(src: str, tgt: str, entries: list[dict], kind: str, style: dict) -> list[dict]:
+def bible_render_messages(src: str, tgt: str, entries: list[dict], kind: str, style: dict,
+                          book_type: str = "literary") -> list[dict]:
     s, t = LANGUAGES[src], LANGUAGES[tgt]
+    if book_type == "technical":
+        return [
+            {"role": "system", "content": f"You are a technical translator from {s.name} into {t.name}. Respond with JSON only."},
+            {"role": "user", "content": (
+                f"For each term give the form a published {t.name} technical book would use. Keep it exactly "
+                f"as in the original when {t.name}-speaking professionals use it that way (product and tool "
+                "names, most acronyms, established English jargon); otherwise give the standard translation.\n"
+                f"Book: {json.dumps(style, ensure_ascii=False)}\n"
+                "Return {\"items\": [{\"source\": str, \"target\": str}]} preserving every source exactly.\n"
+                f"{json.dumps([{'source': e['source'], 'note': e.get('note') or ''} for e in entries], ensure_ascii=False)}"
+            )},
+        ]
     rule = {
         "characters": (
             "For each character give the name as it should appear in the translation. Keep Latin-"

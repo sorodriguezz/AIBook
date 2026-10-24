@@ -128,7 +128,10 @@ export interface BookInfo {
   segments?: number;
   tokens?: number;
   scanned_pages?: number[];
+  book_type?: BookType;
 }
+
+export type BookType = "literary" | "technical";
 
 export interface BibleCharacter {
   source: string;

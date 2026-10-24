@@ -35,6 +35,7 @@ class Settings:
     tgt: str
     quality: str  # "fast" | "high" | "best"
     honorifics: str = "adapt"
+    book_type: str = "literary"  # "literary" | "technical"
 
 
 Emit = Callable[[dict], Awaitable[None]]
@@ -178,7 +179,7 @@ class Pipeline:
             self._check_stop()
             try:
                 data, comp = await self.client.chat_json(
-                    prompts.bible_extract_messages(self.s.src, w, known), temperature=0.1, max_tokens=1500)
+                    prompts.bible_extract_messages(self.s.src, w, known, self.s.book_type), temperature=0.1, max_tokens=1500)
                 self.eta.record(planned, comp.prompt_tokens, comp.completion_tokens, comp.prompt_seconds, comp.gen_seconds)
             except LLMError as e:
                 log.warning("bible window %d failed: %s", i, e)
@@ -193,7 +194,7 @@ class Pipeline:
         style: dict = {}
         try:
             style, comp = await self.client.chat_json(
-                prompts.bible_style_messages(self.s.src, self.s.tgt, sample, known), temperature=0.2, max_tokens=800)
+                prompts.bible_style_messages(self.s.src, self.s.tgt, sample, known, self.s.book_type), temperature=0.2, max_tokens=800)
             self.eta.record(Work(estimate_tokens(sample) + 300, 300), comp.prompt_tokens,
                             comp.completion_tokens, comp.prompt_seconds, comp.gen_seconds)
         except LLMError as e:
@@ -207,7 +208,7 @@ class Pipeline:
                 self._check_stop()
                 try:
                     data, _ = await self.client.chat_json(
-                        prompts.bible_render_messages(self.s.src, self.s.tgt, chunk, kind, style),
+                        prompts.bible_render_messages(self.s.src, self.s.tgt, chunk, kind, style, self.s.book_type),
                         temperature=0.2, max_tokens=2000)
                 except LLMError:
                     continue
@@ -218,7 +219,7 @@ class Pipeline:
                         e["target"] = target.strip()
         self.eta.skip(Work(4000, 1200))
         bible = {"style": style, "characters": known["characters"], "terms": known["terms"],
-                 "honorifics": self.s.honorifics}
+                 "honorifics": self.s.honorifics, "book_type": self.s.book_type}
         self.bible = bible
         self._save_bible_checkpoint(0, 0, None)
         return bible
@@ -261,7 +262,7 @@ class Pipeline:
         chars, terms = prompts.relevant_glossary(self.bible, text)
         fn = prompts.review_system if review else prompts.translator_system
         honor = (self.bible or {}).get("honorifics", self.s.honorifics)
-        return fn(self.s.src, self.s.tgt, self.bible, chars, terms, honor)
+        return fn(self.s.src, self.s.tgt, self.bible, chars, terms, honor, self.s.book_type)
 
     async def _translate_batch(self, batch, context, all_batches, bi, planned: Work) -> list[str]:
         joined = "\n".join(s.plain for s in batch)

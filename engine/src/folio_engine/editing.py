@@ -60,7 +60,8 @@ async def retranslate(store: Store, llm: LlamaServerManager, current_job: dict |
     after = next((r for r in rows[pos + 1:] if r["kind"] not in ("attr", "meta")), None)
     context = [(placeholders.strip(r["source"]), placeholders.strip(r["final"] or r["draft"])) for r in before]
 
-    settings = Settings(job["src"], job["tgt"], job["quality"], opts.get("honorifics", "adapt"))
+    settings = Settings(job["src"], job["tgt"], job["quality"], opts.get("honorifics", "adapt"),
+                        opts.get("book_type", "literary"))
     pipe = Pipeline(client, store, job["id"], settings, EtaTracker(), _noop, lambda: False)
     pipe.bible = job["bible"]
     segment = Segment(seg_id, seg["chapter"], seg["kind"], seg["source"])

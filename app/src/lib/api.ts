@@ -145,6 +145,7 @@ export const engine = {
     output_dir: string | null;
     benchmark: Benchmark | null;
     glossary_seed: GlossaryFile | null;
+    book_type: "literary" | "technical";
   }) => call<Job>("POST", "/jobs", req),
   pause: (id: string) => call("POST", `/jobs/${id}/pause`),
   resume: (id: string, model?: ModelSpec) => call("POST", `/jobs/${id}/resume`, model ?? null),
