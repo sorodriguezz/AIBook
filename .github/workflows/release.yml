@@ -30,10 +30,16 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+            python: "3.12"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            python: "3.12"
+          # PyMuPDF, OpenCV, hyperscan, cryptography… publish no win_arm64
+          # wheels, so on Windows ARM the engine is frozen as x64 and runs under
+          # Prism emulation. The app and llama-server stay native ARM64.
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
+            python: cpython-3.12-windows-x86_64-none
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -55,13 +61,14 @@ jobs:
           workspaces: app/src-tauri
 
       - uses: astral-sh/setup-uv@v6
-      # Native Python for the runner's architecture (ARM64 on windows-11-arm).
-      - run: uv python install 3.12
+      - run: uv python install ${{ matrix.python }}
 
       - name: Fetch llama.cpp server
         run: uv run --no-project python scripts/fetch_llama.py --target ${{ matrix.target }}
 
       - name: Freeze engine
+        env:
+          UV_PYTHON: ${{ matrix.python }}
         run: uv run --project engine --extra pdf --group build python scripts/build_engine.py
 
       - name: Engine smoke test (frozen binary starts)
