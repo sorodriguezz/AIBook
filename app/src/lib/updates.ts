@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { create } from "zustand";
+import type { Key } from "./i18n";
 import { useApp } from "./store";
 
 type Phase = "idle" | "checking" | "available" | "none" | "downloading" | "installing" | "error";
@@ -15,7 +16,7 @@ interface UpdateState {
   total: number;
   bytesPerSec: number;
   etaSeconds: number | null;
-  error: string | null;
+  error: Key | null;
   checkNow: (silent?: boolean) => Promise<void>;
   install: () => Promise<void>;
 }
@@ -37,7 +38,8 @@ export const useUpdates = create<UpdateState>((set, get) => ({
       set({ update, phase: update ? "available" : "none" });
     } catch (e) {
       // No releases yet or offline: stay quiet on the automatic check.
-      set({ phase: silent ? "idle" : "error", error: String(e) });
+      console.warn("update check failed", e);
+      set({ phase: silent ? "idle" : "error", error: updateError(e) });
     }
   },
 
@@ -76,10 +78,22 @@ export const useUpdates = create<UpdateState>((set, get) => ({
       await update.install();
       await relaunch();
     } catch (e) {
-      set({ phase: "error", error: String(e) });
+      console.warn("update install failed", e);
+      set({ phase: "error", error: updateError(e) });
     }
   },
 }));
+
+/** Map the updater plugin's raw errors to something a reader can act on. */
+function updateError(e: unknown): Key {
+  const msg = String(e).toLowerCase();
+  // A release is published per platform as each build finishes, so for a few
+  // minutes latest.json may not list this system yet.
+  if (msg.includes("platform") || msg.includes("404")) return "u.err.pending";
+  if (msg.includes("signature")) return "u.err.signature";
+  if (/network|dns|connect|timed? ?out|sending request|offline/.test(msg)) return "u.err.offline";
+  return "u.err.generic";
+}
 
 /** True while a translation is running; installing would interrupt it. */
 export function translationRunning(): boolean {

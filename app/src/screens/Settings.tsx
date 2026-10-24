@@ -84,7 +84,7 @@ export default function Settings() {
                 {up.phase === "checking" && t("u.checking")}
                 {up.phase === "none" && t("u.none")}
                 {up.phase === "available" && up.update && t("u.available", { v: up.update.version })}
-                {up.phase === "error" && t("u.error", { e: up.error ?? "" })}
+                {up.phase === "error" && up.error && t(up.error)}
               </div>
             </div>
             {up.phase === "available" ? (

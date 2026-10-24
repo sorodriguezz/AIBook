@@ -1,9 +1,10 @@
 name: release
 
 # Push a tag like v0.2.0 (see scripts/bump_version.py) to build, sign and publish.
-# Each platform uploads its installer and updater bundle to the same GitHub
-# Release, and tauri-action merges their entries into latest.json, which the
-# app's updater reads from releases/latest.
+# The release starts as a draft; each platform uploads its installer and updater
+# bundle to it and tauri-action merges their entries into latest.json. Only when
+# all three are in is it published, so releases/latest/download/latest.json (what
+# the app's updater reads) never points at a release missing the user's system.
 on:
   push:
     tags: ["v*"]
@@ -22,8 +23,24 @@ jobs:
       - working-directory: engine
         run: uv run pytest -q
 
-  publish:
+  create-release:
     needs: test-engine
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.draft.outputs.id }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - id: draft
+        run: |
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --title "AIBook $TAG" \
+            --notes "Descarga el instalador para tu sistema. Si ya tienes AIBook, se actualizará solo desde la app."
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -1)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -95,10 +112,22 @@ jobs:
           projectPath: app
           tauriScript: pnpm tauri
           args: --target ${{ matrix.target }} --config src-tauri/tauri.release.json
-          tagName: ${{ github.ref_name }}
-          releaseName: AIBook ${{ github.ref_name }}
-          releaseBody: Descarga el instalador para tu sistema. Si ya tienes AIBook, se actualizará solo desde la app.
-          # Published (not draft) so releases/latest/download/latest.json resolves.
-          releaseDraft: false
-          prerelease: false
+          releaseId: ${{ needs.create-release.outputs.id }}
           includeUpdaterJson: true
+
+  publish-release:
+    needs: [create-release, publish]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild latest.json from the signed bundles
+        run: |
+          mkdir sigs
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "*.sig" -D sigs
+          python3 scripts/updater_manifest.py "$TAG" "$GITHUB_REPOSITORY" sigs
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" latest.json --clobber
+      - name: Publish
+        run: gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest
