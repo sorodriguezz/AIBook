@@ -1,5 +1,7 @@
 import zipfile
 
+import pytest
+
 from folio_engine.formats.epub import EpubBook, read_info
 from folio_engine.translate import booktype, prompts
 
@@ -81,7 +83,7 @@ def test_code_font_detection():
 
 
 def test_code_fonts_not_protected_when_body_is_monospace(tmp_path):
-    import pymupdf
+    pymupdf = pytest.importorskip("pymupdf")
     from folio_engine.formats import pdf
 
     doc = pymupdf.open()
