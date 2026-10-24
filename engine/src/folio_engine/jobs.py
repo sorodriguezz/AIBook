@@ -8,6 +8,8 @@ import time
 import traceback
 from pathlib import Path
 
+import httpx
+
 from . import langs
 from .errors import UserError
 from .eta import EtaTracker, ProgressRateEta
@@ -156,15 +158,33 @@ class JobRunner:
                 self.store.update_job(job_id, status=state)
             except Exception as e:
                 log.error("job %s failed: %s", job_id, traceback.format_exc())
-                code = e.code if isinstance(e, UserError) else "internal"
-                params = e.params if isinstance(e, UserError) else {}
-                stats = {**(self.store.get_job(job_id) or {}).get("stats", {}), "error_code": code, "error_params": params}
-                self.store.update_job(job_id, status="failed", error=str(e), stats=stats)
+                err = self._describe_failure(e)
+                stats = {**(self.store.get_job(job_id) or {}).get("stats", {}),
+                         "error_code": err.code, "error_params": err.params}
+                self.store.update_job(job_id, status="failed", error=str(err), stats=stats)
             finally:
                 self.current = None
                 self._task = None
                 self.flags.pop(job_id, None)
                 await self._publish_job(job_id)
+
+    def _describe_failure(self, e: Exception) -> UserError:
+        """Turn a failure into something the user can act on.
+
+        When llama-server dies mid-request (usually out of memory) the job only
+        sees a dropped connection, often with an empty message.
+        """
+        if isinstance(e, UserError):
+            return e
+        if self.llm.config is not None and not self.llm.running:
+            tail = "\n".join(self.llm.log_tail[-15:])
+            log.error("llama-server output before it stopped:\n%s", "\n".join(self.llm.log_tail[-60:]))
+            return UserError("model_crashed", f"llama-server stopped unexpectedly:\n{tail}", 500)
+        if isinstance(e, httpx.TimeoutException):
+            return UserError("model_request_timeout", f"the model took too long to answer ({type(e).__name__})", 504)
+        if isinstance(e, httpx.TransportError):
+            return UserError("model_crashed", f"lost the connection to llama-server ({type(e).__name__}: {e})", 500)
+        return UserError("internal", str(e) or type(e).__name__, 500, detail=(str(e) or type(e).__name__)[:200])
 
     def _should_stop(self, job_id: str):
         return lambda: job_id in self.flags

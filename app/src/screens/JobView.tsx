@@ -1,7 +1,7 @@
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useEffect, useState } from "react";
 import { Bar, Button, Cover, LangPair } from "../components/ui";
-import { engine } from "../lib/api";
+import { engine, native } from "../lib/api";
 import { friendlyError } from "../lib/errors";
 import { clock, duration, finishTime } from "../lib/format";
 import { t, type Key } from "../lib/i18n";
@@ -102,6 +102,15 @@ export default function JobView({ id }: { id: string }) {
             <div className="mt-6 rounded-xl bg-ribbon-soft px-4 py-3 text-[13px]">
               <div className="font-medium">{t("job.failed")}</div>
               <div className="mt-1 text-ink-2">{friendlyError(new Error(job.error ?? ""), job.stats?.error_code, job.stats?.error_params)}</div>
+              <button
+                className="mt-2 text-[12px] text-ink-3 underline-offset-2 hover:text-ink-2 hover:underline"
+                onClick={async () => {
+                  const log = await native.engineLog();
+                  if (log) revealItemInDir(log).catch(() => {});
+                }}
+              >
+                {t("err.showLog")}
+              </button>
             </div>
           )}
 
