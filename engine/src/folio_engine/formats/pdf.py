@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
+import re
 import shutil
 import threading
 from collections.abc import Awaitable, Callable
@@ -39,10 +40,33 @@ def read_info(path: Path) -> dict:
         if scanned:  # assume scanned pages are as dense as the digital ones
             digital = max(1, doc.page_count - len(scanned))
             tokens += int(tokens / digital * len(scanned)) if tokens else 450 * len(scanned)
-        title = (doc.metadata or {}).get("title") or path.stem
-        return {"title": title, "pages": doc.page_count, "scanned_pages": scanned,
+        return {"title": _title(doc, path), "pages": doc.page_count, "scanned_pages": scanned,
                 "sample": " ".join(texts)[:4000], "language": None, "tokens": tokens,
                 "book_type": _book_type(doc, texts)}
+
+
+_JUNK_TITLE_RE = re.compile(r"^(untitled|sin t[ií]tulo|microsoft word|document\d*$)|\.(pdf|docx?|indd|tex|qxd)$", re.IGNORECASE)
+_HEADING_RE = re.compile(r"^(table of contents|contents|tabla de contenidos?|[ií]ndice|sommaire|inhalt|indice|"
+                         r"copyright|pr[oó]logo|preface|prefacio|introducci[oó]n|introduction)$", re.IGNORECASE)
+
+
+def _title(doc, path: Path) -> str:
+    """The metadata title if it looks like one, else the largest line on the first page, else the file name."""
+    meta = " ".join(((doc.metadata or {}).get("title") or "").split())
+    if meta and not _JUNK_TITLE_RE.search(meta):
+        return meta
+    for page in list(doc)[:1]:  # later pages give "Contents" or chapter titles
+        spans = [(round(s["size"]), " ".join(s["text"].split()))
+                 for b in page.get_text("dict")["blocks"] for line in b.get("lines", []) for s in line["spans"]]
+        spans = [(size, text) for size, text in spans if sum(c.isalpha() for c in text) >= 2]
+        if not spans:
+            continue
+        top = max(size for size, _ in spans)
+        title = " ".join(text for size, text in spans if size == top)[:120].strip()
+        if 2 <= len(title) and top >= 14 and not _HEADING_RE.match(title):
+            return title
+    stem = re.sub(r"[-_]+", " ", path.stem).strip()
+    return stem[:1].upper() + stem[1:] if stem.islower() else stem
 
 
 def _book_type(doc, texts: list[str]) -> str:

@@ -58,10 +58,9 @@ export default function JobView({ id }: { id: string }) {
       <div className="flex items-start gap-8">
         <div className="relative shrink-0">
           <Cover src={job.options.cover} title={job.title} className="h-[150px] w-[100px]" />
-          {/* The bookmark ribbon descends as the book is translated. */}
           <div
-            className="absolute -top-2 right-4 w-[12px] bg-ribbon transition-[height] duration-1000 ease-out"
-            style={{ height: `${18 + value * 150}px`, clipPath: "polygon(0 0,100% 0,100% 100%,50% calc(100% - 7px),0 100%)" }}
+            className="absolute -top-2 right-4 h-[34px] w-[12px] bg-ribbon"
+            style={{ clipPath: "polygon(0 0,100% 0,100% 100%,50% calc(100% - 7px),0 100%)" }}
           />
         </div>
         <div className="min-w-0 flex-1 pt-1">
