@@ -1,6 +1,6 @@
 [package]
 name = "aibook"
-version = "0.1.8"
+version = "0.1.9"
 description = "AIBook — traductor de libros con IA local"
 authors = ["sorodriguezz"]
 edition = "2024"

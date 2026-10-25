@@ -20,7 +20,7 @@ from pathlib import Path
 
 from ..translate import prompts
 from ..translate.segments import Segment
-from . import ocr
+from . import ocr, pdf_layout
 
 log = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ def _book_type(doc, texts: list[str]) -> str:
     from ..translate import booktype
 
     n = doc.page_count
-    pages = sorted({int(i * n / 30) for i in range(min(30, n))})
+    pages = pdf_layout.spread_pages(n, 30)
     mono = total = 0
     for i in pages:
         for block in doc[i].get_text("dict")["blocks"]:
@@ -128,8 +128,7 @@ def _code_font_pattern(path: Path) -> str | None:
 
     code = total = 0
     with pymupdf.open(path) as doc:
-        n = doc.page_count
-        for i in sorted({int(k * n / 20) for k in range(min(20, n))}):
+        for i in pdf_layout.spread_pages(doc.page_count, 20):
             for block in doc[i].get_text("dict")["blocks"]:
                 for line in block.get("lines", []):
                     for span in line["spans"]:
@@ -254,6 +253,7 @@ async def translate_digital(
 
     high_level.init()
     _install_hooks()
+    pdf_layout.install()
     replaying = bool(hooks and hooks.replay)
     # Replays never reach the model, which may not even be loaded.
     llm_base_url = llm_base_url or "http://127.0.0.1:9"
@@ -286,14 +286,17 @@ async def translate_digital(
         auto_extract_glossary=bible is None and not replaying,
         use_rich_pbar=False,
         skip_scanned_detection=False,
+        min_text_length=2,  # short TOC entries and headings ("ONE", "Index") still get translated
     )
     result = None
     if hooks:
         _HOOKS[id(config)] = hooks
+    pdf_layout.BODY_WIDTH[id(config)] = await asyncio.to_thread(pdf_layout.body_width, path)
     try:
         result = await _run_babeldoc(high_level, config, on_progress, should_stop)
     finally:
         _HOOKS.pop(id(config), None)
+        pdf_layout.BODY_WIDTH.pop(id(config), None)
     if result is None or not result.mono_pdf_path:
         raise RuntimeError("BabelDOC finished without producing a PDF")
     return Path(result.mono_pdf_path)
