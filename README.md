@@ -1,77 +1,81 @@
-# AIBook
+<div align="center">
 
-Traductor de libros **PDF y EPUB** con modelos de IA que corren en tu equipo. Conserva títulos, tablas, imágenes y maquetación: solo cambian las palabras. Idiomas: inglés, español, francés, alemán, italiano, japonés y chino (todas las combinaciones).
+# AIBook.
 
-Plataformas: **macOS Apple Silicon**, **Windows x64** y **Windows ARM64**.
+### Tus libros, en tu idioma. Sin que salgan de tu equipo.
 
-## Cómo funciona
+Traduce novelas y libros técnicos en **PDF y EPUB** con inteligencia artificial que funciona en tu propio ordenador.
+Sin suscripciones, sin subir nada a la nube, sin perder una sola página de formato.
 
-```
-Tauri 2 (React UI + Rust)  ──HTTP/WS──►  motor Python (FastAPI)  ──OpenAI API──►  llama-server (llama.cpp)
-  hardware · descargas · sidecars          EPUB · PDF (BabelDOC) · OCR              Metal / Vulkan / CPU ARM64
-                                           pipeline literario · SQLite
-```
+[**Descargar AIBook**](https://github.com/sorodriguezz/AIBook/releases/latest) · macOS (Apple Silicon) · Windows · Windows ARM
 
-**Pipeline literario** (`engine/src/folio_engine/translate/`):
+<br>
 
-1. **Biblia del libro**: el modelo lee el libro completo y extrae personajes (voz, registro, género), lugares y términos inventados, además del tono y el narrador. Se puede revisar y editar antes de traducir.
-2. **Traducción con contexto**: lotes por capítulo con los párrafos anteriores ya traducidos, el glosario pertinente y reglas por idioma (modismos por sentido, voz de cada personaje, convenciones de diálogo: raya en español, « » en francés, 「」 en japonés…).
-3. **Revisión editorial** (modo Impecable): una segunda pasada corrige omisiones, calcos y errores de sentido.
+<img src="docs/screenshot.jpg" alt="AIBook mostrando la pantalla Traduce un libro" width="820">
 
-Cada segmento pasa validadores (marcadores de formato, números, proporción de longitud e idioma de salida) y se guarda en SQLite, de modo que la traducción se reanuda si se interrumpe.
+</div>
 
-**Formato**:
-- **EPUB**: solo cambian los nodos de texto. El formato inline viaja como marcadores `⟦1⟧…⟦/1⟧` y se reconstruye. CSS, imágenes y fuentes se copian byte a byte.
-- **PDF**: BabelDOC reconstruye cada página desde una representación intermedia, y la biblia se le inyecta como system prompt y glosario.
-- **Escaneados**: OCR (RapidOCR) → traducción → se repinta sobre el fondo original.
+<br>
 
-**ETA**: se planifica en tokens leídos y generados. Las velocidades reales se aprenden con medias móviles exponenciales y se recalculan en cada petición. Las descargas usan la misma idea: media móvil de la velocidad, reanudación con HTTP Range y verificación sha256.
+## Suelta tu libro. Lo demás corre por cuenta de AIBook.
 
-## Desarrollo
+Arrastra un PDF o un EPUB, elige el idioma y pulsa **Traducir**. AIBook lee el libro entero antes de empezar, aprende quién es quién y te devuelve un libro que se ve igual que el original: mismos capítulos, mismas tablas, mismas imágenes. Solo cambian las palabras.
 
-Requisitos: Node 22+, pnpm, Rust estable, [uv](https://docs.astral.sh/uv/).
+## Por qué AIBook
 
-```bash
-python3 scripts/fetch_llama.py          # llama-server para tu plataforma
-cd engine && uv sync --extra pdf && uv run pytest -q
-cd ../app && pnpm install && pnpm tauri dev
-```
+**🔒 Privado de verdad**
+Todo ocurre en tu equipo. Ni el libro ni una sola frase de la traducción salen de él. Funciona incluso sin internet, una vez descargado el modelo.
 
-En desarrollo la app lanza el motor con `uv run`. En las versiones de release usa el binario congelado con PyInstaller.
+**📖 Traduce como un editor, no como un diccionario**
+Antes de traducir, AIBook conoce a los personajes, cómo habla cada uno, los lugares y los términos inventados del libro. Mantiene la voz de cada personaje, traduce los modismos por su sentido y respeta las convenciones de cada idioma, como los diálogos con raya en español o las comillas « » en francés.
 
-Prueba de punta a punta con un modelo real:
+**🎨 El libro se ve como el original**
+Títulos, índices, tablas, notas, imágenes y tipografía se quedan donde estaban. Funciona también con **PDF escaneados**: reconoce el texto de la imagen y lo reescribe sobre la página.
 
-```bash
-uv run --project engine python scripts/e2e_smoke.py ruta/al/modelo.gguf
-```
+**🧠 Novela o manual técnico**
+AIBook reconoce el tipo de libro. En las novelas cuida el estilo y la voz; en los libros técnicos deja intactos el código y los comandos, y mantiene la terminología del sector.
 
-## Catálogo de modelos
+**✍️ Tú tienes la última palabra**
+Revisa el glosario de personajes y términos antes de empezar, compara el original con la traducción párrafo a párrafo y corrige lo que quieras. ¿Lees una saga? El glosario se comparte entre los libros de la serie, así los nombres no cambian de un tomo a otro.
 
-`catalog/models.json` se genera con `python3 scripts/build_catalog.py`. El script toma de Hugging Face el tamaño y el sha256, y lee la cabecera GGUF por streaming para obtener la geometría de atención, con la que la app estima la RAM/VRAM que necesita cada modelo. Para cambiar los modelos, edita la lista `MODELS` del script.
+**⏱️ Sabes cuánto falta**
+Una cuenta atrás realista que aprende de tu equipo, avisos al terminar y una cola para dejar varios libros traduciéndose mientras haces otra cosa. Si cierras la app, la traducción sigue donde la dejaste.
 
-## Releases y actualizaciones
+## 7 idiomas, en todas las direcciones
 
-- **`ci.yml`**: en cada PR y en cada push a `main`, ejecuta los tests del motor y compila la app en las 3 plataformas.
-- **`release.yml`**: al subir una etiqueta `vX.Y.Z`, compila en runners nativos (`macos-14`, `windows-latest`, `windows-11-arm`). Descarga llama.cpp, congela el motor y comprueba que arranca, empaqueta, **firma** las actualizaciones y publica la Release de GitHub con los instaladores y `latest.json`.
-- **En la app**: comprueba si hay versión nueva al abrir y cada 6 h. Si la hay, muestra un aviso en la barra lateral con el progreso y el tiempo restante de la descarga. Antes de instalar detiene el motor y `llama-server`, verifica la firma ed25519 y se reinicia. Si hay una traducción en curso, espera a que termine.
+🇪🇸 Español · 🇬🇧 Inglés · 🇫🇷 Francés · 🇩🇪 Alemán · 🇮🇹 Italiano · 🇯🇵 Japonés · 🇨🇳 Chino
 
-Configuración inicial (una sola vez):
+Cualquier combinación, por ejemplo de japonés a español o de alemán a inglés.
 
-1. Crea el repo `github.com/sorodriguezz/AIBook`. Si usas otro nombre, cambia `plugins.updater.endpoints` en `app/src-tauri/tauri.conf.json`.
-2. Añade el secreto `TAURI_SIGNING_PRIVATE_KEY` con el contenido de `~/.tauri/folio.key`, y `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` vacío. **No pierdas esa clave**: sin ella, las versiones instaladas no aceptarán actualizaciones nuevas.
+## El modelo justo para tu equipo
 
-Publicar una versión:
+AIBook revisa tu memoria y tu tarjeta gráfica, y te dice qué modelos van **óptimos**, cuáles **funcionan** y cuáles **no caben**. Los descargas desde la propia app con un clic. Con **Medir en mi equipo** sabrás cuánto tardaría un libro de 300 páginas antes de empezar.
 
-```bash
-python3 scripts/bump_version.py 0.2.0
-```
+## Y además
 
-```bash
-git commit -am "Release v0.2.0" && git tag v0.2.0 && git push --follow-tags
-```
+- **Convierte entre EPUB y PDF**: pasa tus EPUB a PDF, o tus PDF a un EPUB que se adapta a cualquier pantalla.
+- **Biblioteca**: todos tus libros y traducciones en un solo lugar, con sus portadas.
+- **Se actualiza sola**: cuando hay una versión nueva, AIBook te avisa y la instala sin interrumpir lo que estés traduciendo.
 
-Los binarios no tienen firma de sistema operativo (Apple/Microsoft). En macOS hay que permitir la app la primera vez en *Ajustes → Privacidad y seguridad*, y Windows SmartScreen mostrará un aviso.
+## Instalación
 
-## Licencias
+1. Descarga el instalador para tu sistema desde la [**última versión**](https://github.com/sorodriguezz/AIBook/releases/latest).
+2. Ábrelo y, en **Modelos**, descarga el que AIBook te recomiende.
+3. Suelta tu primer libro. 📚
 
-Uso personal / open source. BabelDOC y PyMuPDF son AGPL-3.0, por lo que AIBook se distribuye bajo AGPL-3.0. Cada modelo conserva su propia licencia; la app la muestra en su tarjeta. Por ejemplo, Hunyuan-MT no está licenciado para la UE, el Reino Unido ni Corea del Sur.
+> **Primera vez en macOS:** si el sistema dice que no puede verificar la app, ve a *Ajustes del Sistema → Privacidad y seguridad* y pulsa **Abrir igualmente**.
+>
+> **En Windows:** si aparece SmartScreen, pulsa *Más información → Ejecutar de todas formas*.
+
+### Requisitos
+
+- macOS con chip Apple (M1 o posterior), Windows 10/11 de 64 bits o Windows en ARM.
+- Recomendado: 16 GB de RAM o más. Con 8 GB funciona usando modelos ligeros.
+
+<br>
+
+<div align="center">
+
+**AIBook** es software libre bajo licencia AGPL-3.0 · [Guía para desarrolladores](docs/DEVELOPMENT.md)
+
+</div>
