@@ -50,7 +50,7 @@ uv run --project engine python scripts/e2e_smoke.py ruta/al/modelo.gguf
 ## Releases y actualizaciones
 
 - **`ci.yml`**: en cada PR y en cada push a `main`, ejecuta los tests del motor y compila la app en las 3 plataformas.
-- **`release.yml`**: al subir una etiqueta `vX.Y.Z`, compila en runners nativos (`macos-14`, `windows-latest`, `windows-11-arm`). Descarga llama.cpp, congela el motor y comprueba que arranca, empaqueta, **firma** las actualizaciones y publica la Release de GitHub con los instaladores y `latest.json`.
+- **`release.yml`**: al subir una versión nueva a `main`, crea su tag `vX.Y.Z` y compila en runners nativos (`macos-14`, `windows-latest`, `windows-11-arm`). Descarga llama.cpp, congela el motor y comprueba que arranca, empaqueta, **firma** las actualizaciones y publica la Release de GitHub con los instaladores y `latest.json`.
 - **En la app**: comprueba si hay versión nueva al abrir y cada 6 h. Si la hay, muestra un aviso en la barra lateral con el progreso y el tiempo restante de la descarga. Antes de instalar detiene el motor y `llama-server`, verifica la firma ed25519 y se reinicia. Si hay una traducción en curso, espera a que termine.
 
 Configuración inicial (una sola vez):
@@ -65,7 +65,30 @@ python3 scripts/bump_version.py 0.2.0
 ```
 
 ```bash
-git commit -am "Release v0.2.0" && git tag v0.2.0 && git push --follow-tags
+git add -A
+git commit -m "Release v0.2.0"
+git push origin main
+```
+
+Al hacer push a `main`, el workflow comprueba que la versión coincida en la app, Tauri, el motor
+(si existe) y los archivos de bloqueo. Si `vX.Y.Z` todavía no existe, crea el tag anotado en ese
+mismo commit y construye su release. Un push sin cambio de versión no vuelve a publicar.
+Los tags y las releases pertenecen únicamente a este repositorio.
+
+La compilación y publicación continúan en el mismo workflow: el tag creado con `GITHUB_TOKEN`
+no necesita disparar otro workflow ni requiere un token personal. La release se publica sólo
+cuando están disponibles los instaladores y las actualizaciones firmadas de las tres plataformas.
+
+Si falla una publicación, usa **Actions → release → Re-run all jobs** en la ejecución original.
+También puedes usar **Run workflow** seleccionando el tag de esa versión. Se reutiliza el borrador;
+una release ya publicada no se sobrescribe y un tag existente nunca se mueve a otro commit.
+Si necesitas corregir código, incrementa la versión y sube un commit nuevo.
+
+Comprobar la automatización localmente:
+
+```bash
+python3 scripts/bump_version.py --check
+python3 -m unittest discover -s scripts -p test_release.py -v
 ```
 
 En macOS el paquete completo se firma de forma ad hoc (`bundle.macOS.signingIdentity: "-"`), y CI comprueba su integridad con `codesign --verify --deep --strict` antes de publicar la release. La firma ed25519 del actualizador es independiente: no sustituye la firma del paquete macOS. Sin firmar el paquete completo, el ejecutable puede conservar solo la firma del enlazador y macOS rechaza la app con `code has no resources but signature indicates they must be present`.
