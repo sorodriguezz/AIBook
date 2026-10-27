@@ -45,7 +45,8 @@
     "category": "Productivity",
     "shortDescription": "Traduce libros PDF y EPUB con IA local",
     "macOS": {
-      "minimumSystemVersion": "12.0"
+      "minimumSystemVersion": "12.0",
+      "signingIdentity": "-"
     },
     "windows": {
       "nsis": {

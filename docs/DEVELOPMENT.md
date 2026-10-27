@@ -68,7 +68,9 @@ python3 scripts/bump_version.py 0.2.0
 git commit -am "Release v0.2.0" && git tag v0.2.0 && git push --follow-tags
 ```
 
-Los binarios no tienen firma de sistema operativo (Apple/Microsoft). En macOS hay que permitir la app la primera vez en *Ajustes → Privacidad y seguridad*, y Windows SmartScreen mostrará un aviso.
+En macOS el paquete completo se firma de forma ad hoc (`bundle.macOS.signingIdentity: "-"`), y CI comprueba su integridad con `codesign --verify --deep --strict` antes de publicar la release. La firma ed25519 del actualizador es independiente: no sustituye la firma del paquete macOS. Sin firmar el paquete completo, el ejecutable puede conservar solo la firma del enlazador y macOS rechaza la app con `code has no resources but signature indicates they must be present`.
+
+La firma ad hoc no incluye un certificado Developer ID ni notarización de Apple: en macOS todavía hay que permitir la app la primera vez en *Ajustes → Privacidad y seguridad*. Windows SmartScreen también mostrará un aviso.
 
 ## Licencias
 

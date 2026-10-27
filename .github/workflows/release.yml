@@ -129,6 +129,10 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.id }}
           includeUpdaterJson: true
 
+      - name: Verify macOS app signature before publishing the release
+        if: runner.os == 'macOS'
+        run: codesign --verify --deep --strict --verbose=2 "app/src-tauri/target/${{ matrix.target }}/release/bundle/macos/AIBook.app"
+
   publish-release:
     needs: [create-release, publish]
     runs-on: ubuntu-latest
