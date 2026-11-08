@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from . import benchmark, editing, glossary, jobs, langs
+from . import benchmark, editing, glossary, jobs, langs, sample
 from .exports import Exporter
 from .conversions import Conversions
 from .library import Library, import_books
@@ -36,6 +36,7 @@ class State:
     library: Library
     conversions: Conversions
     exporter: Exporter
+    sampling: bool = False
 
 
 state = State()
@@ -63,7 +64,7 @@ async def lifespan(app: FastAPI):
 def _llm_busy() -> bool:
     # BabelDOC talks to llama-server directly, so a running job counts as busy
     # even between our own tracked requests.
-    return bool(state.runner.current) or not state.runner.queue.empty() or state.llm.active_requests > 0
+    return state.sampling or bool(state.runner.current) or not state.runner.queue.empty() or state.llm.active_requests > 0
 
 
 async def _unload_when_idle() -> None:
@@ -153,27 +154,37 @@ def auth(x_folio_token: str = Header(default="")) -> None:
 
 class ModelSpec(BaseModel):
     model_path: str
-    ctx_size: int = 16384
-    gpu_layers: int = 999
+    ctx_size: int = Field(default=16384, ge=2048, le=262144)
+    gpu_layers: int = Field(default=999, ge=0, le=999)
+    threads: int | None = Field(default=None, ge=1, le=256)
+    cache_ram_mb: int | None = Field(default=None, ge=0, le=16384)
+    batch_size: int | None = Field(default=None, ge=32, le=2048)
+    micro_batch_size: int | None = Field(default=None, ge=32, le=512)
+    kv_cache: Literal["f16", "q8_0", "q4_0"] | None = None
 
 
 class InspectReq(BaseModel):
     path: str
 
 
-class CreateJob(BaseModel):
+class BookSettings(BaseModel):
     path: str
     src: str
     tgt: str
     quality: Literal["fast", "high", "best"] = "best"
-    model_id: str
     model: ModelSpec
     honorifics: Literal["adapt", "keep"] = "adapt"
+    glossary_seed: dict | None = None  # from glossary.read or another job's bible
+    book_type: Literal["literary", "technical"] = "literary"
+    low_memory: bool = False
+    review_scope: Literal["full", "flagged"] = "full"
+
+
+class CreateJob(BookSettings):
+    model_id: str
     review_glossary: bool = False
     output_dir: str | None = None
     benchmark: dict | None = None
-    glossary_seed: dict | None = None  # from glossary.read or another job's bible
-    book_type: Literal["literary", "technical"] = "literary"
 
 
 class SegmentEdit(BaseModel):
@@ -230,6 +241,8 @@ async def inspect(req: InspectReq) -> dict:
 
 @app.post("/jobs", dependencies=[Depends(auth)])
 async def create_job(req: CreateJob) -> dict:
+    if state.sampling:
+        raise UserError("model_busy", "a book sample is using the model", 409)
     langs.validate_pair(req.src, req.tgt)
     if req.glossary_seed:
         glossary.check_pair(req.glossary_seed, req.src, req.tgt)
@@ -237,19 +250,41 @@ async def create_job(req: CreateJob) -> dict:
         raise UserError("file_not_found", "file not found", 404)
     fmt = jobs.detect_format(Path(req.path))
     info = await asyncio.to_thread(jobs.inspect, Path(req.path))
+    if state.sampling:
+        raise UserError("model_busy", "a book sample is using the model", 409)
     job = state.store.create_job(
         input_path=req.path, format=fmt, title=info.get("title"), src=req.src, tgt=req.tgt,
         quality=req.quality, model_id=req.model_id,
         options={
-            "model_path": req.model.model_path, "ctx_size": req.model.ctx_size,
-            "gpu_layers": req.model.gpu_layers, "honorifics": req.honorifics,
+            **req.model.model_dump(exclude_none=True), "honorifics": req.honorifics,
             "review_glossary": req.review_glossary, "output_dir": req.output_dir,
             "benchmark": req.benchmark, "cover": info.get("cover"),
             "glossary_seed": req.glossary_seed, "book_type": req.book_type,
+            "low_memory": req.low_memory, "review_scope": req.review_scope,
         },
     )
     await state.runner.enqueue(job["id"])
     return _public(state.store.get_job(job["id"]))
+
+
+@app.post("/sample", dependencies=[Depends(auth)])
+async def book_sample(req: BookSettings) -> dict:
+    langs.validate_pair(req.src, req.tgt)
+    if req.glossary_seed:
+        glossary.check_pair(req.glossary_seed, req.src, req.tgt)
+    if _llm_busy():
+        raise UserError("model_busy", "the model is busy", 409)
+    state.sampling = True
+    try:
+        options = {**req.model.model_dump(exclude_none=True), "low_memory": req.low_memory}
+        return await sample.run(Path(req.path), state.llm, ServerConfig.from_options(options),
+                                req.src, req.tgt, req.quality, req.book_type, req.honorifics,
+                                req.glossary_seed, req.review_scope, req.low_memory)
+    finally:
+        try:
+            await state.llm.stop()
+        finally:
+            state.sampling = False
 
 
 @app.get("/jobs", dependencies=[Depends(auth)])
@@ -270,12 +305,20 @@ async def pause(job_id: str) -> dict:
 
 
 @app.post("/jobs/{job_id}/resume", dependencies=[Depends(auth)])
-async def resume(job_id: str, req: ModelSpec | None = None) -> dict:
+async def resume(job_id: str, req: ModelSpec | None = None, lighter: bool = False) -> dict:
     job = _job_or_404(job_id)
-    if job["status"] in ("running", "queued"):
+    if job["status"] in ("running", "queued", "done"):
         return {"ok": True}
-    if req:  # the model file may have moved or the user picked another GPU split
-        state.store.update_job(job_id, options={**job["options"], **req.model_dump()})
+    if state.sampling:
+        raise UserError("model_busy", "a book sample is using the model", 409)
+    opts = dict(job["options"])
+    if req:  # permit locating a moved model without replacing this job's settings
+        opts["model_path"] = req.model_path
+    if lighter:
+        opts.update(low_memory=True, cache_ram_mb=0,
+                    batch_size=min(opts.get("batch_size") or 2048, 256),
+                    micro_batch_size=min(opts.get("micro_batch_size") or 512, 64))
+    state.store.update_job(job_id, options=opts)
     await state.runner.enqueue(job_id)
     return {"ok": True}
 
@@ -304,6 +347,8 @@ async def get_bible(job_id: str) -> dict:
 @app.put("/jobs/{job_id}/bible", dependencies=[Depends(auth)])
 async def put_bible(job_id: str, bible: dict) -> dict:
     job = _job_or_404(job_id)
+    if state.sampling and job["status"] == "awaiting_glossary":
+        raise UserError("model_busy", "a book sample is using the model", 409)
     if state.runner.current == job_id:
         raise UserError("glossary_locked", "cannot edit the glossary while translating; pause first", 409)
     state.store.update_job(job_id, bible=bible)
@@ -321,18 +366,29 @@ async def segments(job_id: str, offset: int = 0, limit: int = 200, flagged: bool
             "counts": state.store.counts(job_id)}
 
 
+@app.get("/jobs/{job_id}/activity", dependencies=[Depends(auth)])
+async def activity(job_id: str) -> dict:
+    _job_or_404(job_id)
+    keys = ("seg_id", "kind", "chapter", "source", "draft", "final", "flags", "edited")
+    rows = state.store.recent_translations(job_id)
+    return {"items": [{k: row[k] for k in keys} for row in rows], "counts": state.store.counts(job_id),
+            "saved_at": state.store.saved_at(job_id)}
+
+
 @app.put("/jobs/{job_id}/segment", dependencies=[Depends(auth)])
 async def edit_segment(job_id: str, req: SegmentEdit) -> dict:
     job = _job_or_404(job_id)
     row = editing.save(state.store, job, req.seg_id, req.text)
-    if not job["stats"].get("dirty"):  # the book on disk no longer matches: offer to rebuild it
-        state.store.update_job(job_id, stats={**job["stats"], "dirty": True})
-        await state.runner.publish_job(job_id)
+    stats = job["stats"]
+    state.store.update_job(job_id, stats={**stats, "dirty": True, "edit_revision": stats.get("edit_revision", 0) + 1})
+    await state.runner.publish_job(job_id)
     return {k: row[k] for k in ("seg_id", "kind", "chapter", "source", "draft", "final", "flags", "edited")}
 
 
 @app.post("/jobs/{job_id}/segment/retranslate", dependencies=[Depends(auth)])
 async def retranslate_segment(job_id: str, req: Retranslate) -> dict:
+    if state.sampling:
+        raise UserError("model_busy", "a book sample is using the model", 409)
     job = _job_or_404(job_id)
     current = state.store.get_job(state.runner.current) if state.runner.current else None
     return await editing.retranslate(state.store, state.llm, current, job, req.seg_id, req.instruction)
@@ -447,10 +503,14 @@ async def delete_conversion(cid: str) -> dict:
 
 @app.post("/benchmark", dependencies=[Depends(auth)])
 async def run_benchmark(req: BenchReq) -> dict:
-    if state.runner.current:
+    if _llm_busy():
         raise UserError("translation_running", "a translation is running; pause it to benchmark", 409)
-    client = await state.llm.ensure(ServerConfig(**req.model.model_dump()))
-    return await benchmark.run(client, req.tgt)
+    state.sampling = True
+    try:
+        client = await state.llm.ensure(ServerConfig.from_options(req.model.model_dump(exclude_none=True)))
+        return await benchmark.run(client, req.tgt)
+    finally:
+        state.sampling = False
 
 
 @app.get("/llm/status", dependencies=[Depends(auth)])

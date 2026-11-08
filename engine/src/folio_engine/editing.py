@@ -47,8 +47,7 @@ async def retranslate(store: Store, llm: LlamaServerManager, current_job: dict |
     if not seg:
         raise UserError("segment_not_found", "paragraph not found", 404)
     opts = job["options"]
-    config = ServerConfig(model_path=opts["model_path"], ctx_size=int(opts.get("ctx_size", 16384)),
-                          gpu_layers=int(opts.get("gpu_layers", 999)))
+    config = ServerConfig.from_options(opts)
     # Another book is being translated with a different model: switching models would kill it.
     if current_job and current_job["id"] != job["id"] and llm.running and llm.config != config:
         raise UserError("model_busy", "another translation is using a different model", 409)

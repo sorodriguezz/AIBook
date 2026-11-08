@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button, Cover, Field, FitBadge, LANGS, Segmented, Select } from "../components/ui";
-import { engine } from "../lib/api";
+import { engine, native, type BookSample, type BookSettings, type ModelSpec } from "../lib/api";
 import { friendlyError } from "../lib/errors";
-import { estimate, recommend } from "../lib/estimate";
+import { bestQuant, executionMemory, recommend } from "../lib/estimate";
 import { glossaryFromJob, glossarySources, pickGlossaryFile } from "../lib/glossary";
-import { basename, duration } from "../lib/format";
+import { basename, bytes, duration } from "../lib/format";
 import { t, type Key } from "../lib/i18n";
 import { installedModels, modelSpec, outputDir, prepareNotifications, useApp } from "../lib/store";
 import type { Benchmark, BookInfo, BookType, GlossaryFile, LangCode, Quality } from "../lib/types";
@@ -39,6 +39,17 @@ export default function Configure({ path }: { path: string }) {
   const [review, setReview] = useState(false);
   const [bookType, setBookType] = useState<BookType>("literary");
   const [busy, setBusy] = useState(false);
+  const [lowMemory, setLowMemory] = useState(false);
+  const [context, setContext] = useState(settings.ctxSize);
+  const [quant, setQuant] = useState<string>();
+  const [threads, setThreads] = useState("");
+  const [gpu, setGpu] = useState("");
+  const [cache, setCache] = useState("");
+  const [kvCache, setKvCache] = useState<ModelSpec["kv_cache"]>("f16");
+  const [reviewScope, setReviewScope] = useState<"full" | "flagged">("full");
+  const [sampling, setSampling] = useState(false);
+  const [sample, setSample] = useState<{ key: string; value: BookSample } | null>(null);
+  const [sampleError, setSampleError] = useState<string | null>(null);
   const [seed, setSeed] = useState<GlossaryFile | null>(null);
   const [seedError, setSeedError] = useState<string | null>(null);
   const seedSources = glossarySources(jobs, src, tgt);
@@ -65,6 +76,7 @@ export default function Configure({ path }: { path: string }) {
   };
 
   useEffect(() => {
+    native.hardware().then((hardware) => useApp.setState({ hardware })).catch(() => {});
     engine
       .inspect(path)
       .then((i) => {
@@ -79,42 +91,89 @@ export default function Configure({ path }: { path: string }) {
   }, [path]);
 
   const available = useMemo(() => installedModels(), [catalog, installed]);
+  const usable = useMemo(() => available.map((m) => ({ ...m, quants: Object.fromEntries(
+    Object.entries(m.quants).filter(([, q]) => installed.some((file) => file.file === q.file)),
+  ) })), [available, installed]);
   const suggested = useMemo(
-    () => (available.length ? recommend(available, src, tgt, settings.ctxSize, hardware) : null),
-    [available, src, tgt, settings.ctxSize, hardware],
+    () => (usable.length ? recommend(usable, src, tgt, context, hardware) : null),
+    [usable, src, tgt, context, hardware],
   );
   const [modelId, setModelId] = useState<string | null>(null);
   const chosen = modelId ?? suggested?.id ?? null;
-  const spec = chosen ? modelSpec(chosen) : null;
-  const fit = spec ? estimate(spec.model, spec.quant, settings.ctxSize, hardware).fit : null;
+  const installedChoice = usable.find((m) => m.id === chosen);
+  const preferredQuant = quant ?? (chosen && settings.chosenQuant[chosen]) ?? undefined;
+  const spec = chosen && installedChoice ? modelSpec(chosen, { ctx: context,
+    quant: preferredQuant || bestQuant(installedChoice, context, hardware) }) : null;
+  const model: ModelSpec | null = spec && {
+    ...spec.spec,
+    gpu_layers: gpu === "" ? spec.spec.gpu_layers : Number(gpu),
+    threads: threads === "" ? undefined : Number(threads),
+    cache_ram_mb: cache === "" ? (lowMemory ? 128 : undefined) : Number(cache),
+    batch_size: lowMemory ? 256 : undefined,
+    micro_batch_size: lowMemory ? 64 : undefined,
+    kv_cache: kvCache === "f16" ? undefined : kvCache,
+  };
+  const memory = spec && model ? executionMemory(spec.model, spec.quant, model, hardware) : null;
+  const fit = memory?.fit;
+  const request: BookSettings | null = model && { path, src, tgt, quality, model, honorifics,
+    glossary_seed: seed, book_type: bookType, low_memory: lowMemory, review_scope: reviewScope };
+  const sampleKey = JSON.stringify(request);
+  const currentSample = sample?.key === sampleKey ? sample.value : null;
 
-  const spt = secondsPerToken(spec?.benchmark ?? null, quality);
+  const matchingBenchmark = lowMemory || gpu || threads || cache || model?.kv_cache ? null : spec?.benchmark ?? null;
+  const spt = secondsPerToken(matchingBenchmark, quality);
   const eta = spt && info?.tokens ? spt * info.tokens : null;
+  const sampleEta = currentSample && info?.tokens && currentSample.source_tokens > 0
+    ? currentSample.seconds * info.tokens / currentSample.source_tokens : null;
+
+  const refreshMemory = async () => {
+    const current = await native.hardware();
+    useApp.setState({ hardware: current });
+    return current;
+  };
+
+  const preview = async () => {
+    if (!request || !spec) return;
+    setSampling(true);
+    setSampleError(null);
+    try {
+      const current = await refreshMemory();
+      if (executionMemory(spec.model, spec.quant, request.model, current).fit === "no") {
+        setSampleError(t("cfg.memoryNo"));
+        return;
+      }
+      setSample({ key: sampleKey, value: await engine.sample(request) });
+    } catch (e) {
+      setSampleError(friendlyError(e));
+    } finally {
+      setSampling(false);
+    }
+  };
 
   const start = async () => {
-    if (!spec || !info) return;
+    if (!spec || !info || !request) return;
     setBusy(true);
+    setError(null);
     try {
+      const current = await refreshMemory();
+      if (executionMemory(spec.model, spec.quant, request.model, current).fit === "no") {
+        setError(t("cfg.memoryNo"));
+        return;
+      }
       await updateSettings({ lastTarget: tgt, quality });
       prepareNotifications();
       const job = await engine.createJob({
-        path,
-        src,
-        tgt,
-        quality,
+        ...request,
         model_id: spec.model.id,
-        model: spec.spec,
-        honorifics,
         review_glossary: review && quality !== "fast",
         output_dir: outputDir(),
-        benchmark: spec.benchmark,
-        glossary_seed: seed,
-        book_type: bookType,
+        benchmark: matchingBenchmark,
       });
       useApp.setState((s) => ({ jobs: { ...s.jobs, [job.id]: job } }));
       go({ name: "job", id: job.id });
-    } catch (e: any) {
+    } catch (e) {
       setError(friendlyError(e));
+    } finally {
       setBusy(false);
     }
   };
@@ -189,7 +248,7 @@ export default function Configure({ path }: { path: string }) {
                 </div>
               ) : (
                 <div className="flex items-center gap-4">
-                  <Select value={chosen ?? ""} onChange={setModelId} className="flex-1">
+                  <Select value={chosen ?? ""} onChange={(id) => { setModelId(id); setQuant(undefined); setGpu(""); }} className="flex-1">
                     {available.map((m) => (
                       <option key={m.id} value={m.id}>
                         {m.name}
@@ -202,6 +261,54 @@ export default function Configure({ path }: { path: string }) {
               )}
             </Field>
           </div>
+
+          {spec && memory && (
+            <section className="mt-7 rounded-2xl border border-rule bg-card/70 p-4">
+              <Field label={t("cfg.resources")}>
+                <Segmented value={lowMemory ? "low" : "auto"} onChange={(value) => setLowMemory(value === "low")}
+                  options={[{ value: "auto", label: t("cfg.memoryAuto") }, { value: "low", label: t("cfg.memoryLow") }]} />
+              </Field>
+              {lowMemory && <p className="mt-3 text-[12px] text-ink-2">{t("cfg.memoryLowHint")}</p>}
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[12px] text-ink-2">
+                <span>{t("cfg.memoryEstimate", { ram: bytes(memory.ram), available: memory.available === null ? "—" : bytes(memory.available) })}
+                  {!!memory.vram && ` · ${t("cfg.vramEstimate", { vram: bytes(memory.vram) })}`}</span>
+                <Button variant="quiet" onClick={() => void refreshMemory().catch((e) => setError(friendlyError(e)))}>{t("cfg.refreshMemory")}</Button>
+              </div>
+              {fit === "no" && <p className="text-[12px] text-ribbon">{t("cfg.memoryNo")}</p>}
+              <details className="mt-3 border-t border-rule pt-3">
+                <summary className="cursor-pointer text-[13px] font-medium">{t("cfg.advanced")}</summary>
+                <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                  <Field label={t("cfg.quant")}><Select value={spec.quant} onChange={setQuant}>
+                    {Object.keys(usable.find((m) => m.id === chosen)?.quants ?? {}).map((q) => <option key={q}>{q}</option>)}
+                  </Select></Field>
+                  <Field label={t("s.context")}><Select value={String(context)} onChange={(v) => setContext(Number(v))}>
+                    {[...new Set([4096, 8192, 16384, 32768, 65536, settings.ctxSize])].sort((a, b) => a - b).map((n) =>
+                      <option key={n} value={n}>{n / 1024}K</option>)}
+                  </Select></Field>
+                  <Field label={t("cfg.threads")}><Select value={threads} onChange={setThreads}>
+                    <option value="">{t("cfg.memoryAuto")}</option>
+                    {[1, 2, 4, 8, 16, 32].filter((n) => !hardware || n <= hardware.cores).map((n) => <option key={n}>{n}</option>)}
+                  </Select></Field>
+                  {!!hardware?.gpu_budget_bytes && <Field label={t("cfg.gpuLayers")}><Select value={gpu} onChange={setGpu}>
+                    <option value="">{t("cfg.memoryAuto")}</option><option value="0">0 · CPU</option>
+                    {[...new Set([8, 16, 32, spec.model.geometry.layers].filter((n) => n <= spec.model.geometry.layers))].map((n) => <option key={n}>{n}</option>)}
+                  </Select></Field>}
+                  <Field label={t("cfg.cacheLimit")}><Select value={cache} onChange={setCache}>
+                    <option value="">{t("cfg.memoryAuto")}</option>
+                    {[0, 128, 512, 1024, 2048].map((n) => <option key={n} value={n}>{n} MiB</option>)}
+                  </Select></Field>
+                  <Field label={t("cfg.kvCache")}><Select value={kvCache ?? "f16"} onChange={(v) => setKvCache(v as ModelSpec["kv_cache"])}>
+                    {(["f16", "q8_0", "q4_0"] as const).map((v) => <option key={v}>{v}</option>)}
+                  </Select></Field>
+                  {quality === "best" && (info?.format === "epub" || !!info?.scanned_pages?.length) &&
+                    <Field label={t("cfg.reviewScope")}><Select value={reviewScope} onChange={(v) => setReviewScope(v as typeof reviewScope)}>
+                      <option value="full">{t("cfg.reviewFull")}</option><option value="flagged">{t("cfg.reviewFlagged")}</option>
+                    </Select></Field>}
+                </div>
+                <p className="mt-3 text-[12px] text-ink-3">{t("cfg.advancedHint")}</p>
+              </details>
+            </section>
+          )}
 
           <div className="mt-7">
             <Field label={t("cfg.bookType")}>
@@ -285,12 +392,31 @@ export default function Configure({ path }: { path: string }) {
             </label>
           )}
 
+          {spec && info && <section className="mt-7 border-t border-rule pt-5">
+            <Button disabled={sampling || queued || busy || fit === "no"} onClick={() => void preview()}>
+              {t(sampling ? "cfg.sampling" : "cfg.sample")}
+            </Button>
+            <p className="mt-2 text-[12px] text-ink-3">{t("cfg.sampleHint")}</p>
+            {sampleError && <p role="alert" className="mt-2 text-[13px] text-ribbon">{sampleError}</p>}
+            {currentSample && <div className="mt-4 space-y-3" aria-live="polite">
+              <p className="text-[12px] text-ink-2">{t("cfg.sampleMeasured", { t: duration(currentSample.seconds) })}
+                {currentSample.kind !== "epub" && currentSample.items[0] && ` · ${t("job.page", { n: currentSample.items[0].chapter + 1 })}`}
+              </p>
+              {currentSample.items.map((item, i) => <div key={i} className="grid gap-3 rounded-xl border border-rule bg-card p-4 sm:grid-cols-2">
+                <div><div className="eyebrow mb-2">{t("job.original")}</div><p className="reading break-words">{item.source}</p></div>
+                <div><div className="eyebrow mb-2">{t("job.translation")}</div><p className="reading break-words">{item.target}</p>
+                  {item.flagged && <p className="mt-2 text-[12px] text-ribbon">{t("cfg.sampleFlagged")}</p>}</div>
+              </div>)}
+            </div>}
+          </section>}
+
           <div className="mt-10 flex items-center justify-between border-t border-rule pt-6">
             <div className="tabular text-[13px] text-ink-3">
-              {eta ? t("cfg.estimate", { t: duration(eta) }) : ""}
+              {sampleEta ? t("cfg.sampleEta", { a: duration(sampleEta * 0.7), b: duration(sampleEta * 1.5) })
+                : eta ? t("cfg.estimate", { t: duration(eta) }) : ""}
               {queued && <div className="mt-0.5">{t("cfg.queueHint")}</div>}
             </div>
-            <Button variant="primary" disabled={!spec || !info || busy || fit === "no" || src === tgt} onClick={start}>
+            <Button variant="primary" disabled={!spec || !info || busy || sampling || fit === "no" || src === tgt} onClick={start}>
               {queued ? t("cfg.startQueued") : t("cfg.start")} →
             </Button>
           </div>

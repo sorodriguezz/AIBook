@@ -102,58 +102,103 @@ fn llama_server_path(app: &AppHandle) -> Option<PathBuf> {
     let bundled = app
         .path()
         .resource_dir()
-        .ok()?
-        .join("resources")
-        .join("llama")
-        .join(exe);
-    if bundled.exists() {
+        .ok()
+        .map(|dir| dir.join("resources/llama").join(exe));
+    if let Some(bundled) = bundled.filter(|path| path.is_file()) {
         return Some(bundled);
     }
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("resources")
-        .join("llama")
-        .join(exe);
-    dev.exists().then_some(dev)
+    #[cfg(dev)]
+    {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/llama").join(exe);
+        source.is_file().then_some(source)
+    }
+    #[cfg(not(dev))]
+    None
 }
 
-/// The engine command: the PyInstaller bundle in release builds, `uv run` in development.
-fn engine_command(app: &AppHandle) -> Command {
+/// Use the bundled engine, or launch the source engine from the development environment.
+fn engine_command(app: &AppHandle) -> Result<Command, String> {
     let exe = if cfg!(windows) {
         "folio-engine.exe"
     } else {
         "folio-engine"
     };
-    if let Ok(res) = app.path().resource_dir() {
-        let bundled = res.join("resources").join("engine").join(exe);
-        if bundled.exists() {
-            return Command::new(bundled);
-        }
+    let bundled = app.path().resource_dir().map(|dir| dir.join("resources/engine").join(exe));
+    if let Ok(bundled) = &bundled && bundled.is_file() {
+        return Ok(Command::new(bundled));
     }
-    let engine_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../engine");
-    let mut cmd = Command::new("uv");
-    cmd.current_dir(engine_dir)
-        .args(["run", "--extra", "pdf", "python", "-m", "folio_engine"]);
-    cmd
+    #[cfg(dev)]
+    {
+        let engine_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../engine");
+        development_engine_command(
+            &engine_dir,
+            std::env::var_os("PATH").as_deref(),
+            std::env::var_os("UV_PROJECT_ENVIRONMENT").as_deref(),
+        )
+    }
+    #[cfg(not(dev))]
+    {
+        let bundled = bundled.map_err(|e| e.to_string())?;
+        Err(format!("bundled engine is missing: {}", bundled.display()))
+    }
+}
+
+#[cfg(dev)]
+fn development_engine_command(
+    engine_dir: &std::path::Path,
+    search_path: Option<&std::ffi::OsStr>,
+    project_environment: Option<&std::ffi::OsStr>,
+) -> Result<Command, String> {
+    let uv_exe = if cfg!(windows) { "uv.exe" } else { "uv" };
+    let uv = search_path.and_then(|path| {
+        std::env::split_paths(path)
+            .filter_map(|dir| std::path::absolute(dir.join(uv_exe)).ok())
+            .find(|exe| exe.is_file())
+    });
+    if let Some(uv) = uv {
+        let mut cmd = Command::new(uv);
+        cmd.current_dir(engine_dir)
+            .args(["run", "--extra", "pdf", "python", "-m", "folio_engine"]);
+        return Ok(cmd);
+    }
+
+    let environment = project_environment.filter(|path| !path.is_empty())
+        .unwrap_or_else(|| std::ffi::OsStr::new(".venv"));
+    let interpreter = if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" };
+    let python = engine_dir.join(environment).join(interpreter);
+    if !python.is_file() {
+        return Err(format!("uv is not on PATH and {} is missing. Set up the engine with `uv sync --extra pdf` in {}.",
+                           python.display(), engine_dir.display()));
+    }
+    let mut cmd = Command::new(python);
+    cmd.current_dir(engine_dir).args(["-m", "folio_engine"]);
+    Ok(cmd)
+}
+
+fn launch_error(app: &AppHandle, detail: String) -> String {
+    if let Some(path) = log_path(app) {
+        let _ = std::fs::write(path, &detail);
+    }
+    format!("engine_start_failed\n{detail}")
 }
 
 fn spawn(app: &AppHandle) -> Result<Running, String> {
     let token = uuid::Uuid::new_v4().simple().to_string();
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-    let mut cmd = engine_command(app);
-    cmd.arg("--port")
-        .arg("0")
-        .env("FOLIO_TOKEN", &token)
-        .env("FOLIO_DATA_DIR", &data_dir)
-        .env("FOLIO_PARENT_PID", std::process::id().to_string())
-        .stdout(Stdio::piped());
     // A GUI app on Windows has no console, so inheriting stderr would lose
     // every engine error; keep it in a file instead.
     let log = log_path(app).and_then(|p| {
         std::fs::create_dir_all(p.parent()?).ok()?;
         std::fs::File::create(p).ok()
     });
-    cmd.stderr(log.map(Stdio::from).unwrap_or_else(Stdio::null));
+    let mut cmd = engine_command(app).map_err(|detail| launch_error(app, detail))?;
+    cmd.args(["--port", "0"])
+        .env("FOLIO_TOKEN", &token)
+        .env("FOLIO_DATA_DIR", &data_dir)
+        .env("FOLIO_PARENT_PID", std::process::id().to_string())
+        .stdout(Stdio::piped())
+        .stderr(log.map(Stdio::from).unwrap_or_else(Stdio::null));
     if let Some(llama) = llama_server_path(app) {
         cmd.env("FOLIO_LLAMA_SERVER", llama);
     }
@@ -162,9 +207,9 @@ fn spawn(app: &AppHandle) -> Result<Running, String> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("could not start the engine: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        launch_error(app, format!("could not launch {}: {e}", cmd.get_program().to_string_lossy()))
+    })?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -223,4 +268,40 @@ pub async fn engine_info(app: AppHandle, state: State<'_, Engine>) -> Result<Eng
     };
     *state.inner.lock().unwrap() = Some(running);
     Ok(info)
+}
+
+#[cfg(all(test, dev))]
+mod tests {
+    use super::development_engine_command;
+    use std::{ffi::OsStr, fs};
+
+    #[test]
+    fn finds_development_engine_in_a_different_checkout() {
+        let checkout = std::env::temp_dir().join(format!("AIBook prueba {}", uuid::Uuid::new_v4()));
+        let engine = checkout.join("engine");
+        let interpreter = if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" };
+        let default = engine.join(".venv").join(interpreter);
+        let custom = "entorno de pruebas";
+        let custom_dir = engine.join(custom);
+        let configured = custom_dir.join(interpreter);
+        let tools = checkout.join("tools");
+        let uv = tools.join(if cfg!(windows) { "uv.exe" } else { "uv" });
+        for exe in [&default, &configured, &uv] {
+            fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            fs::write(exe, []).unwrap();
+        }
+
+        let command = development_engine_command(&engine, None, None).unwrap();
+        assert_eq!(command.get_program(), default.as_os_str());
+        for env in [OsStr::new(custom), custom_dir.as_os_str()] {
+            let command = development_engine_command(&engine, None, Some(env)).unwrap();
+            assert_eq!(command.get_program(), configured.as_os_str());
+        }
+        let search_path = std::env::join_paths([tools]).unwrap();
+        let command = development_engine_command(&engine, Some(&search_path), None).unwrap();
+        assert_eq!(command.get_program(), uv.as_os_str());
+        assert!(development_engine_command(&engine, None, Some(OsStr::new("missing"))).is_err());
+
+        fs::remove_dir_all(checkout).unwrap();
+    }
 }

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import shutil
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -13,11 +14,12 @@ import httpx
 from . import langs
 from .errors import UserError
 from .eta import EtaTracker, ProgressRateEta
-from .llm.server_manager import LlamaServerManager, ServerConfig
+from .llm.client import LLMUnavailable
+from .llm.server_manager import LlamaServerManager, ServerConfig, memory_failure
 from .store import Store
 from .translate.pipeline import Pipeline, Settings, Stopped, seeded_entries
 from .translate.segments import Segment
-from .translate import langdetect
+from .translate import langdetect, validators
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +92,26 @@ def output_path_for(job: dict) -> Path:
     return out_dir / f"{src.stem} ({name}){src.suffix}"
 
 
+def require_source(job: dict) -> str:
+    path = Path(job["input_path"])
+    if not path.is_file():
+        raise UserError("file_not_found", "source file not found", 404)
+    st = path.stat()
+    stamp = f"{st.st_size}:{st.st_mtime_ns}"
+    if (previous := job["stats"].get("source_stamp")) and previous != stamp:
+        raise UserError("input_changed", "source file changed after translation started", 409)
+    return stamp
+
+
+async def finish_file_operation(fn, *args):
+    """Keep staged files open until a worker has stopped using them on pause."""
+    task = asyncio.create_task(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(task)
+    finally:
+        await asyncio.gather(task, return_exceptions=True)
+
+
 class JobRunner:
     def __init__(self, store: Store, llm: LlamaServerManager, bus: EventBus, data_dir: Path) -> None:
         self.store = store
@@ -107,7 +129,10 @@ class JobRunner:
 
     async def enqueue(self, job_id: str) -> None:
         self.flags.pop(job_id, None)
-        self.store.update_job(job_id, status="queued", error=None)
+        stats = (self.store.get_job(job_id) or {}).get("stats", {})
+        stats.pop("error_code", None)
+        stats.pop("error_params", None)
+        self.store.update_job(job_id, status="queued", error=None, stats=stats)
         await self.queue.put(job_id)
         await self.publish_job(job_id)
 
@@ -179,9 +204,12 @@ class JobRunner:
         if self.llm.config is not None and not self.llm.running:
             tail = "\n".join(self.llm.log_tail[-15:])
             log.error("llama-server output before it stopped:\n%s", "\n".join(self.llm.log_tail[-60:]))
-            return UserError("model_crashed", f"llama-server stopped unexpectedly:\n{tail}", 500)
+            code = "model_memory" if memory_failure(tail) else "model_crashed"
+            return UserError(code, f"llama-server stopped unexpectedly:\n{tail}", 500)
         if isinstance(e, httpx.TimeoutException):
             return UserError("model_request_timeout", f"the model took too long to answer ({type(e).__name__})", 504)
+        if isinstance(e, LLMUnavailable):
+            return UserError("model_unavailable", str(e), 503)
         if isinstance(e, httpx.TransportError):
             return UserError("model_crashed", f"lost the connection to llama-server ({type(e).__name__}: {e})", 500)
         return UserError("internal", str(e) or type(e).__name__, 500, detail=(str(e) or type(e).__name__)[:200])
@@ -192,21 +220,34 @@ class JobRunner:
     async def _run(self, job: dict) -> None:
         job_id = job["id"]
         opts = job["options"]
-        self.store.update_job(job_id, status="running", phase="loading_model")
+        stamp = require_source(job)
+        job["stats"] = {**job["stats"], "source_stamp": stamp}
+        self.store.update_job(job_id, status="running", phase="preparing", stats=job["stats"])
         await self.publish_job(job_id)
-        await self.bus.publish({"type": "progress", "job_id": job_id, "phase": "loading_model",
-                                "detail": "", "progress": job["progress"], "eta_seconds": None,
-                                "elapsed_seconds": 0})
-        client = await self.llm.ensure(ServerConfig(
-            model_path=opts["model_path"],
-            ctx_size=int(opts.get("ctx_size", 16384)),
-            gpu_layers=int(opts.get("gpu_layers", 999)),
-        ))
         eta = EtaTracker()
+        pdf_info = None
+        if opts.get("low_memory") and job["format"] == "pdf":
+            from .formats import pdf
+
+            path = Path(job["input_path"])
+            await self.llm.stop()
+            pdf_info = await asyncio.to_thread(pdf.read_info, path)
+            scanned = pdf_info["scanned_pages"]
+            if scanned:
+                try:
+                    for n, page in enumerate(scanned, 1):
+                        await self._phase(job, "ocr", eta, detail=f"{n}/{len(scanned)}", kind="pages")
+                        await pdf.recognize_page(path, page, job["src"], self.store, job_id)
+                finally:
+                    pdf.ocr.release_models()
+        await self._phase(job, "loading_model", eta)
+        config = ServerConfig.from_options(opts)
+        client = await self.llm.ensure(config)
         bench = opts.get("benchmark") or {}
         eta.seed(bench.get("prompt_tps"), bench.get("gen_tps"))
         settings = Settings(job["src"], job["tgt"], job["quality"], opts.get("honorifics", "adapt"),
-                        opts.get("book_type", "literary"))
+                            opts.get("book_type", "literary"), opts.get("review_scope", "full"),
+                            config.ctx_size if config.ctx_size < 8192 else None)
 
         async def emit(ev: dict) -> None:
             await self.bus.publish(ev)
@@ -217,14 +258,22 @@ class JobRunner:
         out = output_path_for(job)
 
         if job["format"] == "epub":
-            await self._run_epub(job, pipe, out)
+            warnings = await self._run_epub(job, pipe, out)
         else:
-            await self._run_pdf(job, pipe, out)
+            warnings = await self._run_pdf(job, pipe, out, pdf_info)
 
+        stats = (self.store.get_job(job_id) or job)["stats"]
         self.store.update_job(job_id, status="done", phase="done", progress=1.0, output_path=str(out),
-                              stats={**job["stats"], "elapsed_seconds": round(eta.elapsed())})
+                              stats={**stats, "elapsed_seconds": round(eta.elapsed()), "layout_issues": warnings})
         await self.bus.publish({"type": "progress", "job_id": job_id, "phase": "done", "detail": "",
                                 "progress": 1.0, "eta_seconds": 0, "elapsed_seconds": round(eta.elapsed())})
+
+    async def _phase(self, job: dict, phase: str, eta: EtaTracker, detail: str = "", kind: str = "") -> None:
+        progress = (self.store.get_job(job["id"]) or job)["progress"]
+        self.store.update_job(job["id"], phase=phase)
+        await self.bus.publish({"type": "progress", "job_id": job["id"], "phase": phase, "detail": detail,
+                                "detail_kind": kind, "progress": progress, "eta_seconds": None,
+                                "elapsed_seconds": round(eta.elapsed())})
 
     async def _maybe_bible(self, job: dict, pipe: Pipeline, segs: list[Segment]) -> None:
         """Build the book bible if needed; raises _AwaitGlossary to let the user edit it."""
@@ -243,40 +292,66 @@ class JobRunner:
             self.store.update_job(job["id"], status="awaiting_glossary", phase="awaiting_glossary")
             raise _AwaitGlossary()
 
-    async def _run_epub(self, job: dict, pipe: Pipeline, out: Path) -> None:
+    async def _run_epub(self, job: dict, pipe: Pipeline, out: Path) -> list[dict]:
+        from .formats import layout_check
         from .formats.epub import EpubBook
 
-        book = EpubBook(Path(job["input_path"]), technical=job["options"].get("book_type") == "technical")
-        segs = book.extract()
-        if not self.store.has_segments(job["id"]):
-            self.store.add_segments(job["id"], segs)
-        done = {r["seg_id"]: r for r in self.store.segments(job["id"])}
-        pipe.plan(segs, done)
-        await self._maybe_bible(job, pipe, segs)
-        await pipe.translate_all(segs, done)
-        pipe.phase = "writing"
-        await pipe._report()
-        book.apply(self.store.translations(job["id"]), job["tgt"])
-        await asyncio.to_thread(book.write, out)
+        source = Path(job["input_path"])
+        book = EpubBook(source, technical=job["options"].get("book_type") == "technical")
+        with book.zip:
+            segs = book.extract()
+            if not self.store.has_segments(job["id"]):
+                self.store.add_segments(job["id"], segs)
+            done = {r["seg_id"]: r for r in self.store.segments(job["id"])}
+            pipe.plan(segs, done)
+            await self._maybe_bible(job, pipe, segs)
+            await pipe.translate_all(segs, done)
+            await self._phase(job, "writing", pipe.eta)
+            protected = book.apply(self.store.translations(job["id"]), job["tgt"])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".aibook-", dir=out.parent) as staging:
+                target = Path(staging) / out.name
+                await finish_file_operation(book.write, target)
+                await self._phase(job, "checking_layout", pipe.eta)
+                await finish_file_operation(layout_check.epub, source, target, {*book.docs, book.opf_path})
+                require_source(job)
+                target.replace(out)
+        return [{"code": "protected_epub", "count": len(protected)}] if protected else []
 
-    async def _run_pdf(self, job: dict, pipe: Pipeline, out: Path) -> None:
-        from .formats import pdf
+    async def _run_pdf(self, job: dict, pipe: Pipeline, out: Path, info: dict | None = None) -> list[dict]:
+        from .formats import layout_check, pdf
 
         path = Path(job["input_path"])
-        info = await asyncio.to_thread(pdf.read_info, path)
-        scanned = info["scanned_pages"]
+        info = info or await asyncio.to_thread(pdf.read_info, path)
+        scanned, digital = info["scanned_pages"], info["digital_pages"]
+        if not (scanned or digital):
+            raise UserError("pdf_no_text", "no readable text in this PDF")
         stop = self._should_stop(job["id"])
+
+        async def recognize(i: int):
+            return await pdf.recognize_page(path, i, job["src"], self.store, job["id"])
+
         if pipe.bible is None and job["quality"] == "fast":
             await self._maybe_bible(job, pipe, [])
         if job["quality"] != "fast" and pipe.bible is None:
+            scans = {}
+            for n, page in enumerate(scanned, 1):
+                if stop():
+                    raise Stopped()
+                pipe.phase, pipe.detail = "ocr", f"{n}/{len(scanned)}"
+                if not job["options"].get("low_memory"):
+                    await pipe._report()
+                scans[page] = await recognize(page)
             pipe.phase, pipe.detail = "analyzing", ""
             await pipe._report()
-            segs = await asyncio.to_thread(pdf.bible_segments, path, job["src"], scanned)
+            segs = await asyncio.to_thread(pdf.bible_segments, path, job["src"], scans)
+            if not segs and not digital:
+                raise UserError("pdf_no_text", "no readable text found by OCR")
             pipe.plan(segs, {})
             await self._maybe_bible(job, pipe, segs)
 
         rate = ProgressRateEta()
-        digital_share = 1 - len(scanned) / max(1, info["pages"])
+        digital_share = len(digital) / (len(digital) + len(scanned))
 
         translated = False
 
@@ -290,6 +365,14 @@ class JobRunner:
             detail, kind = "", ""
             if stage == "ocr":
                 phase = "ocr"
+                if current is not None and total_n:
+                    detail, kind = f"{current}/{total_n}", "pages"
+            elif stage == "checking_layout":
+                phase = stage
+            elif stage == "translate_scan":
+                phase, kind = "translating", "pages"
+                if current is not None and total_n:
+                    detail = f"{current}/{total_n}"
             elif stage == pdf.TRANSLATE_STAGE:
                 phase, translated = "translating", True
                 if current is not None and total_n:
@@ -308,22 +391,54 @@ class JobRunner:
 
         work = self.data_dir / "work" / job["id"]
         out.parent.mkdir(parents=True, exist_ok=True)
+
         def record(source: str, translation: str, page: int | None) -> None:
             self.store.record_paragraph(job["id"], pdf.paragraph_id(source), page, source, translation)
 
-        if digital_share > 0:
-            produced = await pdf.translate_digital(
-                path, work / "out", work / "tmp", job["src"], job["tgt"], pipe.bible, self.llm.base_url,
-                lambda s, f, c=None, n=None: on_progress(s, f, c, n, 0.0, digital_share), stop,
-                pdf.ParagraphHooks(record=record), job["options"].get("book_type", "literary"))
-            shutil.move(produced, out)
-        else:
-            shutil.copy(path, out)
-        if scanned:
-            await pdf.translate_scanned_pages(
-                out, scanned, job["src"], job["tgt"], pipe.translate_texts,
-                lambda s, f, c=None, n=None: on_progress(s, f, c, n, digital_share, 1 - digital_share), stop)
-        shutil.rmtree(work, ignore_errors=True)
+        async def translate_scan(page: int, texts: list[str]) -> list[str | None]:
+            ids = [pdf.ocr_paragraph_id(page, i, text) for i, text in enumerate(texts)]
+            missing = [i for i, key in enumerate(ids) if key not in saved]
+            if missing:
+                translations = await pipe.translate_texts([texts[i] for i in missing])
+                for i, translation in zip(missing, translations):
+                    issues = validators.validate(texts[i], translation, job["src"], job["tgt"])
+                    self.store.record_paragraph(job["id"], ids[i], page, texts[i], translation, flags=issues)
+                    saved[ids[i]] = translation
+            return [saved.get(key) for key in ids]
+
+        saved = self.store.translations(job["id"])
+        ocr_overflow: set[int] = set()
+        try:
+            with tempfile.TemporaryDirectory(prefix=".aibook-", dir=out.parent) as staging:
+                target = Path(staging) / out.name
+                if digital:
+                    produced = await pdf.translate_digital(
+                        path, work / "out", work / "tmp", job["src"], job["tgt"], pipe.bible, self.llm.base_url,
+                        lambda s, f, c=None, n=None: on_progress(s, f, c, n, 0.0, digital_share), stop,
+                        pdf.ParagraphHooks(record=record), job["options"].get("book_type", "literary"), pages=digital)
+                    if not self.llm.running:
+                        raise RuntimeError("model stopped while translating the PDF")
+                    shutil.move(produced, target)
+                else:
+                    shutil.copyfile(path, target)
+                if scanned:
+                    changed = await pdf.translate_scanned_pages(
+                        target, scanned, job["src"], job["tgt"], translate_scan,
+                        lambda s, f, c=None, n=None: on_progress(s, f, c, n, digital_share, 1 - digital_share),
+                        stop, recognize, ocr_overflow.add)
+                    if not changed and not digital and not ocr_overflow:
+                        raise UserError("pdf_no_text", "no readable text found by OCR")
+                if job["options"].get("low_memory"):
+                    await self.llm.stop()
+                await on_progress("checking_layout", 0.99)
+                issues = await finish_file_operation(layout_check.pdf, path, target, digital, stop)
+                if stop():
+                    raise Stopped()
+                require_source(job)
+                target.replace(out)
+                return issues + [{"code": "ocr_fit", "page": page} for page in sorted(ocr_overflow)]
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 class _AwaitGlossary(Exception):

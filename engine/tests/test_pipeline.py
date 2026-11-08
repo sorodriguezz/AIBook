@@ -8,6 +8,7 @@ from folio_engine.formats.epub import EpubBook
 from folio_engine.llm.client import Completion
 from folio_engine.store import Store
 from folio_engine.translate.pipeline import Pipeline, Settings
+from folio_engine.translate.segments import Segment
 
 from .make_fixtures import make_epub
 
@@ -112,3 +113,18 @@ async def test_resume_skips_finished_segments(tmp_path):
     pipe2.bible = pipe.bible
     await pipe2.translate_all(segs, done)
     assert first_calls > 0 and len(client2.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_a_saved_draft_inside_a_batch(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    job = store.create_job(input_path="x.epub", format="epub", src="en", tgt="es", quality="high", model_id="m")
+    segs = [Segment("a", 0, "para", "The lantern shone all night."),
+            Segment("b", 0, "para", "The river took the map.")]
+    store.add_segments(job["id"], segs)
+    store.save_draft(job["id"], "a", "El farol brilló toda la noche.")
+    done = {row["seg_id"]: row for row in store.segments(job["id"])}
+    pipe = Pipeline(FakeClient(), store, job["id"], Settings("en", "es", "high"), EtaTracker(), _noop, lambda: False)
+    await pipe.translate_all(segs, done)
+    assert store.translations(job["id"])["a"] == "El farol brilló toda la noche."
+    assert store.segment(job["id"], "b")["final"]

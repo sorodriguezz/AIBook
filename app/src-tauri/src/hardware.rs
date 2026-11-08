@@ -43,7 +43,9 @@ pub fn hardware_info() -> Hardware {
 
     let unified = cfg!(target_os = "macos");
     let gpus = detect_gpus();
-    let gpu_budget = if unified {
+    let gpu_budget = if cfg!(all(windows, target_arch = "aarch64")) {
+        0 // this build ships a CPU-only inference backend
+    } else if unified {
         // macOS lets Metal wire roughly 2/3 of RAM on small machines and 3/4 on
         // larger ones (recommendedMaxWorkingSetSize).
         if ram <= 36 * GIB {

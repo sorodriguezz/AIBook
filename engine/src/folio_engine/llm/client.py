@@ -1,5 +1,6 @@
 """Async client for llama-server's OpenAI-compatible API."""
 
+import asyncio
 import json
 import re
 import time
@@ -23,7 +24,12 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMUnavailable(RuntimeError):
+    """Transport failure after retrying. Leave the job resumable."""
+
+
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
 
 class LLMClient:
@@ -68,9 +74,7 @@ class LLMClient:
         t0 = time.monotonic()
         self._on_use(1)
         try:
-            r = await self._http.post(f"{self.base_url}/v1/chat/completions", json=body)
-        except httpx.HTTPError as e:
-            raise LLMError(f"model server unreachable: {e}") from e
+            r = await self._request(body)
         finally:
             self._on_use(-1)
         if r.status_code != 200:
@@ -89,6 +93,23 @@ class LLMClient:
             # Server without timings: attribute everything to generation.
             p_ms, g_ms = 0.0, wall * 1000
         return Completion(text, p_tok, c_tok, p_ms / 1000, g_ms / 1000, wall)
+
+    async def _request(self, body: dict) -> httpx.Response:
+        for delay in (0.0, 0.5, 1.5):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                response = await self._http.post(f"{self.base_url}/v1/chat/completions", json=body)
+            except httpx.ReadTimeout:
+                # A long generation already exceeded the request deadline.
+                raise
+            except httpx.TransportError as e:
+                failure = e
+                continue
+            if response.status_code not in _RETRYABLE_STATUS:
+                return response
+            failure = RuntimeError(f"model server returned HTTP {response.status_code}")
+        raise LLMUnavailable(str(failure) or type(failure).__name__) from failure
 
     async def chat_json(self, messages: list[dict], **kw) -> tuple[dict, Completion]:
         comp = await self.chat(messages, json_mode=True, **kw)

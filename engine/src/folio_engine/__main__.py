@@ -8,6 +8,10 @@ import sys
 
 
 def main() -> None:
+    # BabelDOC isolates font subsetting and PDF saves in subprocesses.
+    from multiprocessing import freeze_support
+
+    freeze_support()
     parser = argparse.ArgumentParser(prog="folio-engine")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--data-dir")

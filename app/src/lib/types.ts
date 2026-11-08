@@ -109,7 +109,7 @@ export interface ProgressEvent {
   job_id: string;
   phase: string;
   detail: string;
-  detail_kind?: "paragraphs" | "";
+  detail_kind?: "paragraphs" | "pages" | "chapters" | "sections" | "";
   progress: number;
   eta_seconds: number | null;
   elapsed_seconds: number;
@@ -186,6 +186,7 @@ export interface ExportEvent {
   error: string | null;
   error_code: string | null;
   at: number;
+  layout_issues?: { code: string; page?: number; count?: number }[];
 }
 
 /** An AIBook glossary file, or another translation's bible used as one. */

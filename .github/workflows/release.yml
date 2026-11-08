@@ -130,6 +130,11 @@ jobs:
           UV_PYTHON: ${{ matrix.python }}
         run: uv run --project engine --extra pdf --group build python scripts/build_engine.py
 
+      - name: Test translation and layout on the target runtime
+        env:
+          UV_PYTHON: ${{ matrix.python }}
+        run: uv run --project engine --extra pdf pytest -q engine/tests
+
       - name: Engine smoke test (frozen binary serves the app)
         shell: bash
         env:

@@ -9,6 +9,7 @@ export function friendlyError(e: unknown, code?: string | null, params: Record<s
     if (e.status === 0) code = code ?? "engine_down";
   }
   const raw = (e instanceof Error ? e.message : String(e ?? "")).split("\n")[0].slice(0, 200);
+  if (raw === "Scanned PDF detected.") return t("err.pdf_scanned_legacy");
   if (code) {
     const vars: Record<string, string> = { detail: raw || t("err.unknown"), ...params };
     if (params.lang) vars.lang = t(`lang.${params.lang}` as Key);

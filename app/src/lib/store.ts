@@ -176,7 +176,7 @@ export const useApp = create<AppState>((set, get) => ({
         set((s) => ({ exports: { ...s.exports, [ev.job_id]: ev } }));
       }
       syncKeepAwake();
-    });
+    }, () => void get().connectEngine());
     useApp.subscribe((s, prev) => {
       if (s.settings.keepAwake !== prev.settings.keepAwake) syncKeepAwake();
     });
@@ -234,24 +234,25 @@ export function queuePosition(jobId: string): number | null {
 }
 
 /** Path, context and GPU split for running an installed model. */
-export function modelSpec(modelId: string) {
+export function modelSpec(modelId: string, overrides?: { ctx: number; quant?: string }) {
   const { catalog, installed, settings, hardware } = useApp.getState();
   const m = catalog.find((x) => x.id === modelId);
   if (!m) return null;
   const quants = Object.entries(m.quants);
-  const preferred = settings.chosenQuant[m.id];
+  const preferred = overrides?.quant ?? settings.chosenQuant[m.id];
   const pick =
     quants.find(([k, q]) => k === preferred && installed.some((i) => i.file === q.file)) ??
     quants.find(([, q]) => installed.some((i) => i.file === q.file));
   if (!pick) return null;
   const [quant, q] = pick;
   const file = installed.find((i) => i.file === q.file)!;
-  const est = estimate(m, quant, settings.ctxSize, hardware);
+  const ctx = overrides?.ctx ?? settings.ctxSize;
+  const est = estimate(m, quant, ctx, hardware);
   return {
     model: m,
     quant,
-    spec: { model_path: file.path, ctx_size: settings.ctxSize, gpu_layers: est.gpuLayers },
-    benchmark: settings.benchmarks[`${m.id}:${quant}`] ?? null,
+    spec: { model_path: file.path, ctx_size: ctx, gpu_layers: est.gpuLayers },
+    benchmark: ctx === settings.ctxSize ? settings.benchmarks[`${m.id}:${quant}`] ?? null : null,
   };
 }
 

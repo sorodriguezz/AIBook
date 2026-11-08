@@ -35,7 +35,9 @@ cd engine && uv sync --extra pdf && uv run pytest -q
 cd ../app && pnpm install && pnpm tauri dev
 ```
 
-En desarrollo la app lanza el motor con `uv run`. En las versiones de release usa el binario congelado con PyInstaller.
+En desarrollo la app usa `uv run` si encuentra `uv` en el `PATH`. También puede usar un entorno del proyecto ya preparado con `uv sync --extra pdf`, en `engine/.venv` o en la ruta configurada con `UV_PROJECT_ENVIRONMENT`.
+
+El instalador incluye el motor congelado con PyInstaller y `llama-server`. AIBook los busca en los recursos de la instalación. Para generar un instalador desde el repositorio, usa `tauri.release.json` después de preparar esos recursos.
 
 Prueba de punta a punta con un modelo real:
 

@@ -2,7 +2,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useEffect, useState } from "react";
-import { Bar, Button, Field, Segmented } from "../components/ui";
+import { Bar, Button, Field, LANGS, Segmented, Select } from "../components/ui";
 import { engine, type Conversion } from "../lib/api";
 import { friendlyError } from "../lib/errors";
 import { basename, duration, relative } from "../lib/format";
@@ -19,6 +19,7 @@ export default function Convert({ initialPath }: { initialPath?: string }) {
   const [page, setPage] = useState<Page>("a5");
   const [fontSize, setFontSize] = useState("11");
   const [mode, setMode] = useState<Mode>("reflow");
+  const [lang, setLang] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hover, setHover] = useState(false);
@@ -53,7 +54,9 @@ export default function Convert({ initialPath }: { initialPath?: string }) {
     setBusy(true);
     setError(null);
     try {
-      const options = target === "pdf" ? { page, font_size: Number(fontSize), margin_mm: 16 } : { mode };
+      const options = target === "pdf"
+        ? { page, font_size: Number(fontSize), margin_mm: 16 }
+        : { mode, lang: mode === "reflow" && lang ? lang : undefined };
       const c = await engine.convert({ path, target, options, out_dir: outputDir() });
       useApp.setState((s) => ({ conversions: { ...s.conversions, [c.id]: c } }));
       setPath(null);
@@ -127,16 +130,26 @@ export default function Convert({ initialPath }: { initialPath?: string }) {
                 </Field>
               </>
             ) : (
-              <Field label={t("cv.mode")}>
-                <Segmented<Mode>
-                  value={mode}
-                  onChange={setMode}
-                  options={[
-                    { value: "reflow", label: t("cv.mode.reflow"), hint: t("cv.mode.reflow.hint") },
-                    { value: "fixed", label: t("cv.mode.fixed"), hint: t("cv.mode.fixed.hint") },
-                  ]}
-                />
-              </Field>
+              <>
+                <Field label={t("cv.mode")}>
+                  <Segmented<Mode>
+                    value={mode}
+                    onChange={setMode}
+                    options={[
+                      { value: "reflow", label: t("cv.mode.reflow"), hint: t("cv.mode.reflow.hint") },
+                      { value: "fixed", label: t("cv.mode.fixed"), hint: t("cv.mode.fixed.hint") },
+                    ]}
+                  />
+                </Field>
+                {mode === "reflow" && (
+                  <Field label={t("cv.language")} hint={t("cv.language.hint")}>
+                    <Select value={lang} onChange={setLang} className="max-w-[260px]">
+                      <option value="">{t("cv.language.auto")}</option>
+                      {LANGS.map((code) => <option key={code} value={code}>{t(`lang.${code}`)}</option>)}
+                    </Select>
+                  </Field>
+                )}
+              </>
             )}
           </div>
 

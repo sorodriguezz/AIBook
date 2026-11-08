@@ -1,4 +1,5 @@
 import type { CatalogModel, Hardware, QuantKey } from "./types";
+import type { ModelSpec } from "./api";
 
 const GB = 1024 ** 3;
 
@@ -56,6 +57,21 @@ export function estimate(m: CatalogModel, quant: QuantKey, ctx: number, hw: Hard
     fit = total <= ram * 0.55 ? "works" : total <= ram * 0.8 ? "slow" : "no";
   }
   return { weights, kv, total, fit, gpuLayers };
+}
+
+/** Model and inference buffers. The prompt cache can grow separately up to its configured cap. */
+export function executionMemory(model: CatalogModel, quant: QuantKey, spec: ModelSpec, hw: Hardware | null) {
+  const base = estimate(model, quant, spec.ctx_size, hw);
+  const kvScale = spec.kv_cache === "q8_0" ? 0.55 : spec.kv_cache === "q4_0" ? 0.30 : 1;
+  const total = base.total - base.kv * (1 - kvScale);
+  const gpuShare = Math.min(1, spec.gpu_layers / Math.max(1, model.geometry.layers));
+  const vram = !hw?.unified_memory && hw?.gpu_budget_bytes ? total * gpuShare : 0;
+  const ram = Math.max(0.45 * GB, total - vram);
+  const available = hw?.available_ram_bytes ?? null;
+  const headroom = available == null ? null : Math.max(0, available - Math.max(0.5 * GB, available * 0.10));
+  const unsafeGpu = !!hw && vram > hw.gpu_budget_bytes * 0.95;
+  const fits = !unsafeGpu && (headroom == null || ram <= headroom);
+  return { ram, vram, available, fit: (fits ? base.fit === "no" ? "slow" : base.fit : "no") as Fit };
 }
 
 /** Best quant that still runs well, falling back to the smallest one. */

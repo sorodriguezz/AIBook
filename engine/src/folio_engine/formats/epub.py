@@ -202,18 +202,22 @@ class EpubBook:
             "caption" if name in CAPTION_TAGS else "para"
         sid = f"{p}#{len(segs)}"
         segs.append(Segment(sid, ci, kind, source, title))
-        self._slots[sid] = ("block", el, mapping)
+        self._slots[sid] = ("block", el, mapping, source)
 
     # ---- rebuild --------------------------------------------------------
-    def apply(self, translations: dict[str, str], tgt: str) -> None:
+    def apply(self, translations: dict[str, str], tgt: str) -> list[str]:
+        protected = []
         for sid, slot in self._slots.items():
             tr = translations.get(sid)
             if tr is None:
                 continue
             kind = slot[0]
             if kind == "block":
-                _, el, mapping = slot
-                rebuild_inline(el, tr, mapping)
+                _, el, mapping, source = slot
+                if placeholders.check(source, tr):
+                    protected.append(sid)
+                elif tr != source:
+                    rebuild_inline(el, tr, mapping)
             elif kind == "attr":
                 _, el, attr = slot
                 el.set(attr, placeholders.strip(tr))
@@ -230,6 +234,7 @@ class EpubBook:
                 else:
                     node.tail = val
         self._set_language(tgt)
+        return protected
 
     def _set_language(self, tgt: str) -> None:
         bcp = {"zh": "zh-Hans"}.get(tgt, tgt)

@@ -1,4 +1,5 @@
 import zipfile
+from xml.etree import ElementTree
 
 import pytest
 
@@ -93,3 +94,36 @@ def test_cancel(tmp_path):
     src = make_pdf(tmp_path / "book.pdf")
     with pytest.raises(convert.Cancelled):
         convert.pdf_to_epub_fixed(src, tmp_path / "x.epub", dpi=40, should_stop=lambda: True)
+
+
+def test_reflow_recovers_missing_font_mappings_and_uses_pdf_bookmarks(tmp_path):
+    src = tmp_path / "libro.pdf"
+    first = "¿Dónde está el pingüino? ¡España tiene uno!"
+    second = "Esta es una segunda línea y es un nuevo párrafo."
+    font = pymupdf.Font("helv")
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        xref = page.insert_font(fontname="embedded", fontbuffer=font.buffer)
+        page.insert_text((40, 70), first, fontname="embedded")
+        page.insert_text((60, 87), second, fontname="embedded")
+        # Emulate a PDF producer that left spaces and some accents out of ToUnicode.
+        cmap_ref = int(doc.xref_get_key(xref, "ToUnicode")[1].split()[0])
+        cmap = doc.xref_stream(cmap_ref)
+        chars = sorted(set(first + second) - set(" óñ"))
+        mappings = "\n".join(f"<{font.has_glyph(ord(c)):04x}><{ord(c):04x}>" for c in chars)
+        head = cmap.split(b"endcodespacerange")[0] + b"endcodespacerange"
+        body = f"\n{len(chars)} beginbfchar\n{mappings}\nendbfchar\n".encode()
+        doc.update_stream(cmap_ref, head + body + b"endcmap" + cmap.split(b"endcmap")[1])
+        doc.new_page().insert_text((40, 70), "El siguiente capítulo continúa en otra sección.")
+        doc.set_toc([[1, "Introducción", 1], [1, "Capítulo dos", 2]])
+        doc.xref_set_key(doc.pdf_catalog(), "Lang", "(es-CL)")
+        doc.save(src)
+
+    out = convert.pdf_to_epub_reflow(src, tmp_path / "libro.epub")
+    with zipfile.ZipFile(out) as z:
+        chapter = z.read("OEBPS/text/ch001.xhtml")
+        root = ElementTree.fromstring(chapter)
+        assert [p.text for p in root.findall(".//{*}p")] == [first, second]
+        assert root.attrib["lang"] == "es"
+        assert "Capítulo dos" in z.read("OEBPS/nav.xhtml").decode()
+        assert "OEBPS/text/ch002.xhtml" in z.namelist()

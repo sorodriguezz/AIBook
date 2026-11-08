@@ -1,13 +1,14 @@
 import { save } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useEffect, useState } from "react";
+import LiveActivity, { useJobActivity } from "../components/LiveActivity";
 import Reviewer from "../components/Reviewer";
 import { Bar, Button, Cover, LangPair } from "../components/ui";
 import { engine, native } from "../lib/api";
 import { friendlyError } from "../lib/errors";
-import { basename, clock, duration, finishTime } from "../lib/format";
+import { basename, clock, duration, finishTime, relative } from "../lib/format";
 import { t, type Key } from "../lib/i18n";
-import { modelSpec, queuePosition, useApp } from "../lib/store";
+import { queuePosition, useApp } from "../lib/store";
 import type { Job } from "../lib/types";
 import Glossary from "./Glossary";
 
@@ -15,15 +16,12 @@ export default function JobView({ id }: { id: string }) {
   const job = useApp((s) => s.jobs[id]);
   const progress = useApp((s) => s.progress[id]);
   const go = useApp((s) => s.go);
-  const [lastPreview, setLastPreview] = useState<{ source: string; target: string } | null>(null);
   // Immediate feedback while the engine stops; cleared when the status changes.
-  const [stopping, setStopping] = useState<"pause" | "cancel" | null>(null);
+  const [action, setAction] = useState<"pause" | "cancel" | "resume" | "lighter" | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [reviewing, setReviewing] = useState(false);
-  useEffect(() => setStopping(null), [job?.status]);
-
-  useEffect(() => {
-    if (progress?.preview) setLastPreview(progress.preview);
-  }, [progress?.preview]);
+  useEffect(() => setAction(null), [job?.status]);
+  const activity = useJobActivity(id, !!job && job.status !== "done", job?.status === "running");
 
   // Elapsed time keeps ticking between engine events.
   const [tick, setTick] = useState(0);
@@ -40,13 +38,26 @@ export default function JobView({ id }: { id: string }) {
   if (!job) return null;
   const running = job.status === "running" || job.status === "queued";
   const value = job.status === "done" ? 1 : progress?.progress ?? job.progress;
-  const eta = progress?.eta_seconds != null ? Math.max(0, progress.eta_seconds - sinceEvent) : null;
+  const eta = progress?.eta_seconds != null && progress.eta_seconds > sinceEvent ? progress.eta_seconds - sinceEvent : null;
   const elapsed = (progress?.elapsed_seconds ?? 0) + (running ? sinceEvent : 0);
   const phase = job.status === "awaiting_glossary" ? "awaiting_glossary" : progress?.phase ?? job.phase ?? "loading_model";
+  const progressLabel = {
+    paragraphs: "job.paragraphs", chapters: "job.chapter", pages: "job.progressPages", sections: "job.progressSections", "": null,
+  }[progress?.detail_kind ?? ""];
+  const detail = progressLabel && /^\d+\/\d+$/.test(progress?.detail ?? "")
+    ? t(progressLabel as Key, { d: progress!.detail.replace("/", " / ") }) : null;
 
-  const resume = async () => {
-    const spec = modelSpec(job.model_id);
-    await engine.resume(job.id, spec?.spec);
+  const changeStatus = async (next: NonNullable<typeof action>) => {
+    setAction(next);
+    setActionError(null);
+    try {
+      if (next === "resume") await engine.resume(job.id);
+      else if (next === "lighter") await engine.resumeLighter(job.id);
+      else await engine[next](job.id);
+    } catch (e) {
+      setAction(null);
+      setActionError(friendlyError(e));
+    }
   };
 
   return (
@@ -82,9 +93,10 @@ export default function JobView({ id }: { id: string }) {
         <section className="rise mt-12">
           <div className="flex items-end justify-between gap-6">
             <div>
-              <div className="eyebrow">{t(`phase.${phase}` as Key)}{progress?.detail && phase === "translating"
-                ? ` · ${t(progress.detail_kind === "paragraphs" ? "job.paragraphs" : "job.chapter", { d: progress.detail.replace("/", " / ") })}`
-                : ""}</div>
+              <div className="eyebrow">
+                {t(`phase.${phase}` as Key)}
+                {detail && ` · ${detail}`}
+              </div>
               <div className="display tabular mt-3 text-[64px] font-extralight leading-none">
                 {job.status === "running" ? (eta != null ? duration(eta) : <span className="breathe text-[40px] text-ink-3">{t("job.calculating")}</span>)
                   : job.status === "queued" && queuePosition(job.id) ? t("job.queued", { n: queuePosition(job.id)! })
@@ -102,6 +114,11 @@ export default function JobView({ id }: { id: string }) {
             <div className="display tabular text-[28px] font-light text-ink-2">{Math.floor(value * 100)}%</div>
           </div>
           <Bar value={value} active={job.status === "running"} className="mt-6" />
+          <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-[12px] text-ink-3">
+            {!!activity.data?.saved_at && <span>{t("job.savedAt", { t: relative(activity.data.saved_at) })}</span>}
+            {job.status === "running" && sinceEvent > 30 && <span role="status">{t("job.waitingStage")}</span>}
+            {job.options.low_memory && <span>{t("cfg.memoryLow")}</span>}
+          </div>
 
           {job.status === "failed" && (
             <div className="mt-6 rounded-xl bg-ribbon-soft px-4 py-3 text-[13px]">
@@ -121,16 +138,21 @@ export default function JobView({ id }: { id: string }) {
 
           <div className="mt-6 flex gap-2">
             {job.status === "running" && (
-              <Button disabled={!!stopping} onClick={() => { setStopping("pause"); engine.pause(job.id).catch(() => setStopping(null)); }}>
-                {stopping === "pause" ? <span className="breathe">{t("job.pausing")}</span> : t("job.pause")}
+              <Button disabled={!!action} onClick={() => void changeStatus("pause")}>
+                {action === "pause" ? <span className="breathe">{t("job.pausing")}</span> : t("job.pause")}
               </Button>
             )}
             {(job.status === "paused" || job.status === "failed" || job.status === "cancelled") && (
-              <Button variant="primary" onClick={resume}>{job.status === "failed" ? t("job.retry") : t("job.resume")}</Button>
+              <Button variant="primary" disabled={!!action} onClick={() => void changeStatus("resume")}>
+                {action === "resume" || action === "lighter" ? <span className="breathe">{t("job.resuming")}</span> : t(job.status === "failed" ? "job.retry" : "job.resume")}
+              </Button>
+            )}
+            {job.status === "failed" && job.stats?.error_code === "model_memory" && job.options.cache_ram_mb !== 0 && (
+              <Button disabled={!!action} onClick={() => void changeStatus("lighter")}>{t("job.resumeLighter")}</Button>
             )}
             {running && (
-              <Button variant="danger" disabled={!!stopping} onClick={() => { setStopping("cancel"); engine.cancel(job.id).catch(() => setStopping(null)); }}>
-                {stopping === "cancel" ? <span className="breathe">{t("job.cancelling")}</span> : t("job.cancel")}
+              <Button variant="danger" disabled={!!action} onClick={() => void changeStatus("cancel")}>
+                {action === "cancel" ? <span className="breathe">{t("job.cancelling")}</span> : t("job.cancel")}
               </Button>
             )}
             {!running && (
@@ -139,28 +161,18 @@ export default function JobView({ id }: { id: string }) {
               </Button>
             )}
           </div>
+          {actionError && <p role="alert" className="mt-3 text-[13px] text-ribbon">{actionError}</p>}
 
-          {job.status !== "queued" && job.progress > 0 && (
-            <div className="mt-8 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-rule pt-5">
-              <ExportButton job={job} partial />
-              <Button variant="quiet" onClick={() => setReviewing(!reviewing)}>{t("job.review")} {reviewing ? "↑" : "↓"}</Button>
+          <div className="mt-8 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-rule pt-5">
+            <div className="flex gap-1" role="group" aria-label={t("rv.title")}>
+              <Button variant={reviewing ? "quiet" : "ghost"} aria-pressed={!reviewing} onClick={() => setReviewing(false)}>{t("job.liveToggle")}</Button>
+              <Button variant={reviewing ? "ghost" : "quiet"} aria-pressed={reviewing} onClick={() => setReviewing(true)}>{t("job.review")}</Button>
             </div>
-          )}
-          {reviewing && (
-            <div className="rise mt-6">
-              <Reviewer job={job} />
-            </div>
-          )}
-
-          {lastPreview && !reviewing && (
-            <div className="rise mt-12">
-              <div className="eyebrow mb-4">{t("job.livePreview")}</div>
-              <div className="grid grid-cols-2 gap-10 border-t border-rule pt-5">
-                <p className="reading text-ink-3">{lastPreview.source}</p>
-                <p key={lastPreview.target} className="reading rise">{lastPreview.target}</p>
-              </div>
-            </div>
-          )}
+            {!!activity.data?.counts.translated && <ExportButton job={job} partial />}
+          </div>
+          <div className="mt-5">
+            {reviewing ? <Reviewer job={job} /> : <LiveActivity job={job} activity={activity} />}
+          </div>
         </section>
       )}
     </div>
@@ -170,6 +182,8 @@ export default function JobView({ id }: { id: string }) {
 function Result({ job }: { job: Job }) {
   const elapsed = job.stats?.elapsed_seconds;
   const [tab, setTab] = useState<"pages" | "text">(job.format === "pdf" ? "pages" : "text");
+  const [issuePage, setIssuePage] = useState<{ page: number } | null>(null);
+  const issues: { code: string; page?: number; count?: number }[] = job.stats.layout_issues ?? [];
   const [glossaryError, setGlossaryError] = useState<string | null>(null);
   const exportGlossary = async () => {
     setGlossaryError(null);
@@ -188,7 +202,7 @@ function Result({ job }: { job: Job }) {
   return (
     <section className="rise mt-10">
       <div className="flex items-center gap-3">
-        <span className="display text-[22px]">{t("phase.done")}</span>
+        <span className="display text-[22px]">{t(issues.length ? "job.doneWithIssues" : "phase.done")}</span>
         {elapsed != null && <span className="tabular text-[13px] text-ink-3">· {duration(elapsed)}</span>}
       </div>
       <div className="mt-5 flex flex-wrap gap-2">
@@ -199,6 +213,18 @@ function Result({ job }: { job: Job }) {
       {glossaryError && <div className="mt-4 rounded-xl bg-ribbon-soft px-4 py-3 text-[13px]">{glossaryError}</div>}
 
       <RebuildBanner job={job} />
+
+      {!!issues.length && <details className="mt-6 rounded-xl border border-rule bg-ribbon-soft px-4 py-3" open>
+        <summary className="cursor-pointer text-[13px] font-medium">{t("job.layoutReview", { n: issues.length })}</summary>
+        <ul className="mt-2 max-h-48 space-y-1 overflow-y-auto text-[13px] text-ink-2">
+          {issues.map((issue, i) => <li key={i} className="flex items-center justify-between gap-2">
+            <span>{t(`layout.${issue.code}` as Key, { n: issue.count ?? 0 })}</span>
+            {!!issue.page && <Button variant="quiet" onClick={() => { setIssuePage({ page: issue.page! - 1 }); setTab("pages"); }}>
+              {t("job.page", { n: issue.page })} →
+            </Button>}
+          </li>)}
+        </ul>
+      </details>}
 
       <div className="mt-12">
         <div className="mb-4 flex items-center gap-4">
@@ -217,7 +243,7 @@ function Result({ job }: { job: Job }) {
             </div>
           )}
         </div>
-        {tab === "pages" ? <PdfCompare job={job} /> : <Reviewer job={job} />}
+        {tab === "pages" ? <PdfCompare job={job} jump={issuePage} /> : <Reviewer job={job} />}
       </div>
     </section>
   );
@@ -265,15 +291,17 @@ function ExportButton({ job, partial }: { job: Job; partial?: boolean }) {
           {t("ex.done", { f: basename(ev.path) })}
         </button>
       )}
+      {!!ev?.layout_issues?.length && ev.state === "done" && <span className="text-[12.5px] text-ribbon">{t("job.layoutReview", { n: ev.layout_issues.length })}</span>}
       {ev?.state === "failed" && <span className="text-[12.5px] text-ribbon">{friendlyError(new Error(ev.error ?? ""), ev.error_code)}</span>}
       {error && <span className="text-[12.5px] text-ribbon">{error}</span>}
     </div>
   );
 }
 
-function PdfCompare({ job }: { job: Job }) {
+function PdfCompare({ job, jump }: { job: Job; jump?: { page: number } | null }) {
   const [page, setPage] = useState(0);
   const [urls, setUrls] = useState<{ a: string; b: string } | null>(null);
+  useEffect(() => { if (jump) setPage(jump.page); }, [jump]);
   useEffect(() => {
     // The output changes when the book is rebuilt: bust the image cache.
     const v = `&v=${job.stats?.exported_at ?? 0}`;

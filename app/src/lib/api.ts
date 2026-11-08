@@ -11,6 +11,7 @@ import type {
   InstalledModel,
   Job,
   Segment,
+  SegmentCounts,
   SegmentPage,
 } from "./types";
 
@@ -127,28 +128,47 @@ export interface ModelSpec {
   model_path: string;
   ctx_size: number;
   gpu_layers: number;
+  threads?: number;
+  cache_ram_mb?: number;
+  batch_size?: number;
+  micro_batch_size?: number;
+  kv_cache?: "f16" | "q8_0" | "q4_0";
+}
+
+export interface BookSettings {
+  path: string;
+  src: string;
+  tgt: string;
+  quality: string;
+  model: ModelSpec;
+  honorifics: string;
+  glossary_seed: GlossaryFile | null;
+  book_type: "literary" | "technical";
+  low_memory?: boolean;
+  review_scope?: "full" | "flagged";
+}
+
+export interface BookSample {
+  kind: "epub" | "pdf" | "ocr";
+  seconds: number;
+  source_tokens: number;
+  items: { source: string; target: string; chapter: number; flagged: boolean }[];
 }
 
 export const engine = {
   inspect: (path: string) => call<BookInfo>("POST", "/inspect", { path }),
   jobs: () => call<Job[]>("GET", "/jobs"),
   job: (id: string) => call<Job>("GET", `/jobs/${id}`),
-  createJob: (req: {
-    path: string;
-    src: string;
-    tgt: string;
-    quality: string;
+  createJob: (req: BookSettings & {
     model_id: string;
-    model: ModelSpec;
-    honorifics: string;
     review_glossary: boolean;
     output_dir: string | null;
     benchmark: Benchmark | null;
-    glossary_seed: GlossaryFile | null;
-    book_type: "literary" | "technical";
   }) => call<Job>("POST", "/jobs", req),
+  sample: (req: BookSettings) => call<BookSample>("POST", "/sample", req),
   pause: (id: string) => call("POST", `/jobs/${id}/pause`),
   resume: (id: string, model?: ModelSpec) => call("POST", `/jobs/${id}/resume`, model ?? null),
+  resumeLighter: (id: string) => call("POST", `/jobs/${id}/resume?lighter=true`, null),
   cancel: (id: string) => call("POST", `/jobs/${id}/cancel`),
   remove: (id: string) => call("DELETE", `/jobs/${id}`),
   bible: (id: string) => call<Bible>("GET", `/jobs/${id}/bible`),
@@ -159,6 +179,7 @@ export const engine = {
       `/jobs/${id}/segments?offset=${opts.offset ?? 0}&limit=${opts.limit ?? 200}` +
         `&flagged=${!!opts.flagged}&q=${encodeURIComponent(opts.q ?? "")}`,
     ),
+  activity: (id: string) => call<{ items: Segment[]; counts: SegmentCounts; saved_at?: number | null }>("GET", `/jobs/${id}/activity`),
   editSegment: (id: string, seg_id: string, text: string) => call<Segment>("PUT", `/jobs/${id}/segment`, { seg_id, text }),
   retranslate: (id: string, seg_id: string, instruction: string) =>
     call<{ text: string; problems: string[] }>("POST", `/jobs/${id}/segment/retranslate`, { seg_id, instruction }),
@@ -189,19 +210,26 @@ export const engine = {
 };
 
 /** Subscribe to engine events, reconnecting if the socket drops. */
-export function subscribeEvents(onEvent: (ev: any) => void): () => void {
+export function subscribeEvents(onEvent: (ev: any) => void, onReconnect: () => void): () => void {
   let ws: WebSocket | null = null;
   let closed = false;
   let retry = 500;
 
   const connect = async () => {
     try {
-      const { url, token } = await engineInfo();
+      const info = engineInfo();
+      const { url, token } = await info;
+      if (closed) return;
       ws = new WebSocket(url.replace(/^http/, "ws") + `/events?token=${token}`);
       ws.onmessage = (m) => onEvent(JSON.parse(m.data));
-      ws.onopen = () => (retry = 500);
+      ws.onopen = () => {
+        if (retry !== 500) onReconnect();
+        retry = 500;
+      };
       ws.onclose = () => {
-        if (!closed) setTimeout(connect, (retry = Math.min(retry * 2, 8000)));
+        if (closed) return;
+        if (enginePromise === info) enginePromise = null;
+        setTimeout(connect, (retry = Math.min(retry * 2, 8000)));
       };
     } catch {
       if (!closed) setTimeout(connect, (retry = Math.min(retry * 2, 8000)));

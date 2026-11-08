@@ -6,14 +6,10 @@ the same box, shrinking the font only as much as needed to fit.
 """
 
 import html
-import logging
 from dataclasses import dataclass
 from functools import lru_cache
 
-log = logging.getLogger(__name__)
-
 OCR_DPI = 300
-_OCR_LANG = {"ja": "japan", "zh": "ch", "en": "en", "es": "latin", "fr": "latin", "de": "latin", "it": "latin"}
 
 
 @dataclass
@@ -52,30 +48,32 @@ class Block:
 
 @lru_cache(maxsize=4)
 def _engine(src: str):
-    from rapidocr import LangRec, RapidOCR
+    from rapidocr import RapidOCR
 
-    lang = _OCR_LANG.get(src, "ch")
-    try:
-        return RapidOCR(params={"Rec.lang_type": LangRec(lang)})
-    except Exception as e:  # model for that language unavailable in this version
-        log.warning("OCR model for %s unavailable (%s); using default", lang, e)
-        return RapidOCR()
+    # The bundled PP-OCRv6 model takes individual language codes, including
+    # Spanish and French. The old "latin" model family is specific to v5.
+    return RapidOCR(params={"Rec.lang_type": {"ja": "japan", "zh": "ch"}.get(src, src)})
 
 
-def is_scanned(page) -> bool:
-    text = page.get_text("text").strip()
+def release_models() -> None:
+    _engine.cache_clear()
+
+
+def is_scanned(page, text: str) -> bool:
+    text = text.strip()
     if len(text) >= 25:
         return False
-    images = page.get_images(full=False)
+    images = page.get_image_info()
     if not images:
         return False
+    if not text:
+        return True
     # Mostly covered by an image and no real text layer.
-    area = page.rect.width * page.rect.height
-    covered = 0.0
-    for img in images:
-        for r in page.get_image_rects(img[0]):
-            covered += r.width * r.height
-    return covered / max(area, 1) > 0.5
+    import pymupdf
+
+    bounds = page.rect * page.derotation_matrix
+    return any((pymupdf.Rect(image["bbox"]) & bounds).get_area() > bounds.get_area() * 0.5
+               for image in images)
 
 
 def ocr_page(page, src: str) -> list[Line]:
@@ -92,8 +90,8 @@ def ocr_page(page, src: str) -> list[Line]:
     for box, txt, score in zip(result.boxes, result.txts, result.scores):
         if score < 0.5 or not txt.strip():
             continue
-        xs = [p[0] for p in box]
-        ys = [p[1] for p in box]
+        xs = [float(p[0]) for p in box]
+        ys = [float(p[1]) for p in box]
         lines.append(Line(min(xs) * scale, min(ys) * scale, max(xs) * scale, max(ys) * scale, txt))
     return lines
 
@@ -109,7 +107,8 @@ def group_blocks(lines: list[Line]) -> list[Block]:
             gap = ln.y0 - last.y1
             similar_size = abs(ln.height - last.height) < 0.35 * max(ln.height, last.height)
             overlaps_x = ln.x0 < last.x1 and ln.x1 > last.x0
-            if 0 <= gap < 0.9 * last.height and similar_size and overlaps_x:
+            aligned = abs(ln.x0 - last.x0) < 1.2 * last.height
+            if -0.2 * last.height <= gap < 0.75 * last.height and similar_size and overlaps_x and aligned:
                 target = b
                 break
         if target:
@@ -139,6 +138,7 @@ def background_color(page, rect) -> tuple[float, float, float]:
     import pymupdf
 
     r = pymupdf.Rect(rect) + (-3, -3, 3, 3)
+    r *= page.rotation_matrix
     r &= page.rect
     pix = page.get_pixmap(clip=r, dpi=72, colorspace=pymupdf.csRGB)
     a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
@@ -149,17 +149,23 @@ def background_color(page, rect) -> tuple[float, float, float]:
     return tuple(float(c) / 255 for c in med[:3])
 
 
-def repaint(page, block: Block, translated: str, tgt: str) -> None:
+def repaint(page, block: Block, translated: str, tgt: str) -> bool:
     import pymupdf
 
-    rect = pymupdf.Rect(block.rect)
+    visual_rect = pymupdf.Rect(block.rect)
+    rect = visual_rect * page.derotation_matrix
     color = background_color(page, rect)
-    page.draw_rect(rect + (-1, -1, 1, 1), color=None, fill=color, overlay=True)
     line_h = sum(l.height for l in block.lines) / len(block.lines)
     font_pt = max(5.0, line_h * 0.78)
     family = {"ja": "serif", "zh": "serif"}.get(tgt, "serif")
     css = f"* {{ font-family: {family}; font-size: {font_pt:.1f}pt; line-height: 1.15; margin: 0; }}"
     body = html.escape(translated)
-    # insert_htmlbox shrinks the content to fit the rectangle and falls back to
-    # bundled Noto fonts for CJK glyphs.
-    page.insert_htmlbox(rect, f'<p lang="{tgt}">{body}</p>', css=css, scale_low=0.35)
+    # Layout first, so a failed fit cannot erase the original lettering.
+    with pymupdf.open() as overlay:
+        tile = overlay.new_page(width=visual_rect.width, height=visual_rect.height)
+        spare, scale = tile.insert_htmlbox(tile.rect, f'<p lang="{tgt}">{body}</p>', css=css, scale_low=0.55)
+        if spare < 0 or font_pt * scale < min(font_pt, 6):
+            return False
+        page.draw_rect(rect + (-1, -1, 1, 1), color=None, fill=color, overlay=True)
+        page.show_pdf_page(rect, overlay, 0, rotate=page.rotation, overlay=True)
+        return True

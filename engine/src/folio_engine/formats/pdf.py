@@ -15,11 +15,12 @@ import re
 import shutil
 import threading
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass
 from pathlib import Path
 
 from ..translate import prompts
 from ..translate.segments import Segment
+from ..store import Store
 from . import ocr, pdf_layout
 
 log = logging.getLogger(__name__)
@@ -34,13 +35,18 @@ def read_info(path: Path) -> dict:
     with pymupdf.open(path) as doc:
         from ..translate.segments import estimate_tokens
 
-        scanned = [i for i, page in enumerate(doc) if ocr.is_scanned(page)]
-        texts = [page.get_text("text") for page in doc]
+        scanned, digital, texts = [], [], []
+        for i, page in enumerate(doc):
+            text = page.get_text("text")
+            texts.append(text)
+            if ocr.is_scanned(page, text):
+                scanned.append(i)
+            elif text.strip():
+                digital.append(i)
         tokens = sum(estimate_tokens(t) for t in texts)
         if scanned:  # assume scanned pages are as dense as the digital ones
-            digital = max(1, doc.page_count - len(scanned))
-            tokens += int(tokens / digital * len(scanned)) if tokens else 450 * len(scanned)
-        return {"title": _title(doc, path), "pages": doc.page_count, "scanned_pages": scanned,
+            tokens += int(tokens / max(1, len(digital)) * len(scanned)) if digital else 450 * len(scanned)
+        return {"title": _title(doc, path), "pages": doc.page_count, "scanned_pages": scanned, "digital_pages": digital,
                 "sample": " ".join(texts)[:4000], "language": None, "tokens": tokens,
                 "book_type": _book_type(doc, texts)}
 
@@ -55,7 +61,7 @@ def _title(doc, path: Path) -> str:
     meta = " ".join(((doc.metadata or {}).get("title") or "").split())
     if meta and not _JUNK_TITLE_RE.search(meta):
         return meta
-    for page in list(doc)[:1]:  # later pages give "Contents" or chapter titles
+    for page in doc.pages(0, min(doc.page_count, 1)):  # later pages give "Contents" or chapter titles
         spans = [(round(s["size"]), " ".join(s["text"].split()))
                  for b in page.get_text("dict")["blocks"] for line in b.get("lines", []) for s in line["spans"]]
         spans = [(size, text) for size, text in spans if sum(c.isalpha() for c in text) >= 2]
@@ -87,16 +93,15 @@ def _book_type(doc, texts: list[str]) -> str:
     return booktype.classify("\n".join(texts[i] for i in pages), mono / max(1, total))
 
 
-def bible_segments(path: Path, src: str, scanned: list[int]) -> list[Segment]:
+def bible_segments(path: Path, src: str, scans: dict[int, list[ocr.Block]]) -> list[Segment]:
     """Plain-text segments used only to analyse the book before translation."""
     import pymupdf
 
     segs: list[Segment] = []
     with pymupdf.open(path) as doc:
         for i, page in enumerate(doc):
-            if i in scanned:
-                blocks = ocr.group_blocks(ocr.ocr_page(page, src))
-                texts = [b.text(src in ("ja", "zh")) for b in blocks]
+            if i in scans:
+                texts = [b.text(src in ("ja", "zh")) for b in scans[i]]
             else:
                 texts = [b[4] for b in page.get_text("blocks") if b[6] == 0]
             for j, t in enumerate(texts):
@@ -245,6 +250,8 @@ async def translate_digital(
     should_stop: Callable[[], bool],
     hooks: ParagraphHooks | None = None,
     book_type: str = "literary",
+    *,
+    pages: list[int],
 ) -> Path:
     from babeldoc.docvision.doclayout import DocLayoutModel
     from babeldoc.format.pdf import high_level
@@ -271,6 +278,7 @@ async def translate_digital(
     config = TranslationConfig(
         translator=translator,
         input_file=str(path),
+        pages=",".join(str(i + 1) for i in pages),
         lang_in=BABELDOC_LANG[src],
         lang_out=BABELDOC_LANG[tgt],
         doc_layout_model=layout,
@@ -285,7 +293,9 @@ async def translate_digital(
         glossaries=_glossary(bible, tgt),
         auto_extract_glossary=bible is None and not replaying,
         use_rich_pbar=False,
-        skip_scanned_detection=False,
+        # AIBook already routes pages without usable text to OCR. BabelDOC's
+        # visual comparison can also reject valid text layers on mixed PDFs.
+        skip_scanned_detection=True,
         min_text_length=2,  # short TOC entries and headings ("ONE", "Index") still get translated
     )
     result = None
@@ -303,21 +313,62 @@ async def translate_digital(
 
 
 async def _run_babeldoc(high_level, config, on_progress: ProgressCb, should_stop: Callable[[], bool]):
-    result = None
-    async for event in high_level.async_translate(config):
-        if should_stop():
-            raise asyncio.CancelledError()
-        etype = event.get("type")
-        if etype in ("progress_update", "progress_end", "progress_start"):
-            await on_progress(event.get("stage", ""), float(event.get("overall_progress", 0.0)) / 100,
-                              event.get("stage_current"), event.get("stage_total"))
-        elif etype == "error":
-            raise RuntimeError(str(event.get("error")))
-        elif etype == "finish":
-            # BabelDOC's event stream does not end on its own after "finish".
-            result = event["translate_result"]
-            break
-    return result
+    from babeldoc.progress_monitor import ProgressMonitor
+
+    # Own the worker future so failures are observed and cancellation can wait
+    # for BabelDOC to release its files before a retry starts.
+    loop = asyncio.get_running_loop()
+    events = asyncio.Queue()
+    cancel = threading.Event()
+
+    def progress(**event):
+        if event["type"].startswith("progress_"):
+            loop.call_soon_threadsafe(events.put_nowait, event)
+
+    def run():
+        try:
+            with ProgressMonitor(high_level.get_translation_stage(config), progress_change_callback=progress,
+                                 finish_callback=lambda **_: None, cancel_event=cancel,
+                                 report_interval=config.report_interval) as monitor:
+                return high_level.do_translate(monitor, config)
+        finally:
+            loop.call_soon_threadsafe(events.put_nowait, None)
+
+    worker = loop.run_in_executor(None, run)
+    try:
+        while (event := await events.get()) is not None:
+            if should_stop():
+                raise asyncio.CancelledError()
+            await on_progress(event["stage"], event["overall_progress"] / 100,
+                              event["stage_current"], event["stage_total"])
+        return await asyncio.shield(worker)
+    finally:
+        cancel.set()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+def scan_blocks(page, src: str) -> list[ocr.Block]:
+    blocks = [b for b in ocr.group_blocks(ocr.ocr_page(page, src)) if len(b.text(src in ("ja", "zh"))) > 1]
+    if ocr.is_prose_page(blocks, src in ("ja", "zh")):
+        return blocks
+    log.info("page %d: artwork, blank or too little text to translate", page.number + 1)
+    return []
+
+
+async def recognize_page(path: Path, index: int, src: str, store: Store, job_id: str) -> list[ocr.Block]:
+    import pymupdf
+
+    saved = store.ocr_page(job_id, index)
+    if saved is not None:
+        return [ocr.Block([ocr.Line(*line) for line in block]) for block in saved]
+
+    def scan():
+        with pymupdf.open(path) as doc:
+            return scan_blocks(doc[index], src)
+
+    blocks = await asyncio.to_thread(scan)
+    store.save_ocr_page(job_id, index, [[astuple(line) for line in block.lines] for block in blocks])
+    return blocks
 
 
 async def translate_scanned_pages(
@@ -325,32 +376,42 @@ async def translate_scanned_pages(
     pages: list[int],
     src: str,
     tgt: str,
-    translate_texts: Callable[[list[str]], Awaitable[list[str]]],
+    translate: Callable[[int, list[str]], Awaitable[list[str | None]]],
     on_progress: ProgressCb,
     should_stop: Callable[[], bool],
-) -> None:
+    recognize: Callable[[int], Awaitable[list[ocr.Block]]],
+    on_overflow: Callable[[int], None] = lambda _: None,
+) -> bool:
     """OCR, translate and repaint the given pages of `pdf_path` in place."""
     import pymupdf
 
     cjk_src = src in ("ja", "zh")
-    doc = pymupdf.open(pdf_path)
-    try:
+    changed = False
+    tmp = pdf_path.with_suffix(".ocr.pdf")
+    with pymupdf.open(pdf_path) as doc:
         for n, i in enumerate(pages):
             if should_stop():
                 raise asyncio.CancelledError()
-            await on_progress("ocr", n / max(1, len(pages)))
+            await on_progress("ocr", n / len(pages), n + 1, len(pages))
             page = doc[i]
-            lines = await asyncio.to_thread(ocr.ocr_page, page, src)
-            blocks = [b for b in ocr.group_blocks(lines) if len(b.text(cjk_src)) > 1]
-            if not ocr.is_prose_page(blocks, cjk_src):
-                log.info("page %d: artwork or title page, left untouched", i)
+            blocks = await recognize(i)
+            if not blocks:
                 continue
-            translated = await translate_texts([b.text(cjk_src) for b in blocks])
+            await on_progress("translate_scan", n / len(pages), n + 1, len(pages))
+            translated = await translate(i, [b.text(cjk_src) for b in blocks])
             for b, t in zip(blocks, translated):
-                ocr.repaint(page, b, t, tgt)
-        tmp = pdf_path.with_suffix(".ocr.pdf")
-        doc.save(tmp, garbage=3, deflate=True)
-    finally:
-        doc.close()
-    shutil.move(tmp, pdf_path)
+                if t:
+                    if ocr.repaint(page, b, t, tgt):
+                        changed = True
+                    else:
+                        on_overflow(i + 1)
+        if changed:
+            doc.save(tmp, garbage=3, deflate=True)
+    if changed:
+        tmp.replace(pdf_path)
     await on_progress("ocr", 1.0)
+    return changed
+
+
+def ocr_paragraph_id(page: int, index: int, text: str) -> str:
+    return f"ocr:{page}:{index}:{hashlib.sha1(text.encode()).hexdigest()[:20]}"

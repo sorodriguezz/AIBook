@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from .. import langs
 from ..eta import EtaTracker, Work
+from ..errors import UserError
 from ..llm.client import Completion, LLMClient, LLMError
 from ..store import Store
 from . import placeholders, prompts, validators
@@ -36,19 +37,21 @@ class Settings:
     quality: str  # "fast" | "high" | "best"
     honorifics: str = "adapt"
     book_type: str = "literary"  # "literary" | "technical"
+    review_scope: str = "full"
+    context_limit: int | None = None  # opt-in budgeting for a shorter context
 
 
 Emit = Callable[[dict], Awaitable[None]]
 
 
-def batches(segs: list[Segment]) -> list[list[Segment]]:
+def batches(segs: list[Segment], budget: int = BATCH_TOKENS) -> list[list[Segment]]:
     out: list[list[Segment]] = []
     cur: list[Segment] = []
     cur_tok = 0
     for s in segs:
         t = estimate_tokens(s.source)
         new_chapter = cur and cur[-1].chapter != s.chapter
-        if cur and (new_chapter or cur_tok + t > BATCH_TOKENS or len(cur) >= BATCH_MAX_SEGS):
+        if cur and (new_chapter or cur_tok + t > budget or len(cur) >= BATCH_MAX_SEGS):
             out.append(cur)
             cur, cur_tok = [], 0
         cur.append(s)
@@ -92,8 +95,13 @@ class Pipeline:
         self.detail = ""
 
     # ---- planning ----------------------------------------------------------
+    def _batches(self, segs: list[Segment]) -> list[list[Segment]]:
+        limit = self.s.context_limit
+        return batches(segs, min(BATCH_TOKENS, max(100, (limit - SYSTEM_OVERHEAD) // 6)) if limit else BATCH_TOKENS)
+
     def bible_windows(self, segs: list[Segment]) -> list[str]:
         windows, cur, cur_tok = [], [], 0
+        budget = min(BIBLE_WINDOW, max(200, self.s.context_limit // 3)) if self.s.context_limit else BIBLE_WINDOW
         for s in segs:
             if s.kind in ("attr", "meta"):
                 continue
@@ -102,7 +110,7 @@ class Pipeline:
                 continue
             cur.append(p)
             cur_tok += estimate_tokens(p)
-            if cur_tok >= BIBLE_WINDOW:
+            if cur_tok >= budget:
                 windows.append("\n".join(cur))
                 cur, cur_tok = [], 0
         if cur:
@@ -121,18 +129,22 @@ class Pipeline:
             for w in windows[first:]:
                 work += Work(estimate_tokens(w) + 500, 350)
             work += Work(4000, 1200)  # style + rendering of names
-        for b in batches(segs):
-            src_tok = sum(estimate_tokens(x.source) for x in b)
-            need_draft = any(not done.get(x.id, {}).get("draft") for x in b)
-            need_final = self.s.quality == "best" and any(not done.get(x.id, {}).get("final") for x in b)
-            if need_draft:
+        for b in self._batches(segs):
+            rows = [done.get(seg.id, {}) for seg in b]
+            src_tok = sum(estimate_tokens(seg.source) for seg, row in zip(b, rows)
+                          if not (row.get("draft") or row.get("final")))
+            if src_tok:
                 work += Work(SYSTEM_OVERHEAD + 250 + src_tok, src_tok * ratio * 1.1)
-            if need_final:
-                work += Work(SYSTEM_OVERHEAD + 250 + src_tok * (1 + ratio), src_tok * ratio * 1.1)
+            if self.s.quality == "best":
+                review_tok = sum(estimate_tokens(seg.source) for seg, row in zip(b, rows) if not row.get("final"))
+                if review_tok:
+                    work += Work(SYSTEM_OVERHEAD + 250 + review_tok * (1 + ratio), review_tok * ratio * 1.1)
         self.eta.plan(work)
 
     async def _report(self, preview: tuple[str, str] | None = None) -> None:
         event = {"type": "progress", "job_id": self.job_id, "phase": self.phase, "detail": self.detail,
+                 "detail_kind": {"ocr": "pages", "analyzing": "sections", "translating": "chapters",
+                                 "reviewing": "chapters"}.get(self.phase, ""),
                  **self.eta.snapshot()}
         if preview:
             event["preview"] = {"source": placeholders.strip(preview[0]), "target": placeholders.strip(preview[1])}
@@ -142,6 +154,19 @@ class Pipeline:
     def _check_stop(self) -> None:
         if self.should_stop():
             raise Stopped()
+
+    async def _output_budget(self, messages: list[dict], wanted: int) -> int:
+        if not self.s.context_limit:
+            return wanted
+        prompt = "\n".join(m["content"] for m in messages)
+        count = await self.client.tokenize_count(prompt)
+        return min(wanted, self.s.context_limit - count - 96)
+
+    async def _bible_json(self, messages: list[dict], temperature: float, max_tokens: int):
+        budget = await self._output_budget(messages, max_tokens)
+        if budget < 160:
+            raise UserError("context_small", "not enough context for glossary analysis")
+        return await self.client.chat_json(messages, temperature=temperature, max_tokens=budget)
 
     async def _call(self, messages: list[dict], planned: Work, **kw) -> Completion:
         self._check_stop()
@@ -178,7 +203,7 @@ class Pipeline:
             planned = Work(estimate_tokens(w) + 500, 350)
             self._check_stop()
             try:
-                data, comp = await self.client.chat_json(
+                data, comp = await self._bible_json(
                     prompts.bible_extract_messages(self.s.src, w, known, self.s.book_type), temperature=0.1, max_tokens=1500)
                 self.eta.record(planned, comp.prompt_tokens, comp.completion_tokens, comp.prompt_seconds, comp.gen_seconds)
             except LLMError as e:
@@ -188,12 +213,12 @@ class Pipeline:
             _merge(known, data)
             self._save_bible_checkpoint(i + 1, len(windows), known)
 
-        sample = "\n".join(windows[:2])[:9000]
+        sample = "\n".join(windows[:2])[:min(9000, self.s.context_limit or 9000)]
         self.detail = "style"
         await self._report()
         style: dict = {}
         try:
-            style, comp = await self.client.chat_json(
+            style, comp = await self._bible_json(
                 prompts.bible_style_messages(self.s.src, self.s.tgt, sample, known, self.s.book_type), temperature=0.2, max_tokens=800)
             self.eta.record(Work(estimate_tokens(sample) + 300, 300), comp.prompt_tokens,
                             comp.completion_tokens, comp.prompt_seconds, comp.gen_seconds)
@@ -203,11 +228,12 @@ class Pipeline:
         for kind in ("characters", "terms"):
             entries = known[kind]
             entries = [e for e in entries if not e.get("locked")]
-            for start in range(0, len(entries), 40):
-                chunk = entries[start:start + 40]
+            chunk_size = 12 if self.s.context_limit else 40
+            for start in range(0, len(entries), chunk_size):
+                chunk = entries[start:start + chunk_size]
                 self._check_stop()
                 try:
-                    data, _ = await self.client.chat_json(
+                    data, _ = await self._bible_json(
                         prompts.bible_render_messages(self.s.src, self.s.tgt, chunk, kind, style, self.s.book_type),
                         temperature=0.2, max_tokens=2000)
                 except LLMError:
@@ -226,32 +252,47 @@ class Pipeline:
 
     # ---- pass B/C: translate and review ------------------------------------
     async def translate_all(self, segs: list[Segment], done: dict[str, dict]) -> None:
-        all_batches = batches(segs)
+        all_batches = self._batches(segs)
         context: list[tuple[str, str]] = []
         chapters = max((s.chapter for s in segs), default=0) + 1
         ratio = langs.expansion_ratio(self.s.src, self.s.tgt)
         for bi, batch in enumerate(all_batches):
-            src_tok = sum(estimate_tokens(x.source) for x in batch)
             self.detail = f"{batch[0].chapter + 1}/{chapters}"
-            drafts = [done.get(x.id, {}).get("draft") for x in batch]
-            finals = [done.get(x.id, {}).get("final") for x in batch]
+            rows = [done.get(seg.id, {}) for seg in batch]
+            finals = [row.get("final") for row in rows]
+            drafts = [row.get("draft") or final for row, final in zip(rows, finals)]
 
-            draft_work = Work(SYSTEM_OVERHEAD + 250 + src_tok, src_tok * ratio * 1.1)
-            if not all(drafts):
+            pending = [i for i, text in enumerate(drafts) if not text]
+            if pending:
                 self.phase = "translating"
                 await self._report()
-                drafts = await self._translate_batch(batch, context, all_batches, bi, draft_work)
-                for seg, d in zip(batch, drafts):
-                    if self.s.quality != "best":
-                        self.store.save_final(self.job_id, seg.id, d)
+                subset = [batch[i] for i in pending]
+                src_tok = sum(estimate_tokens(seg.source) for seg in subset)
+                draft_work = Work(SYSTEM_OVERHEAD + 250 + src_tok, src_tok * ratio * 1.1)
+                for i, draft in zip(pending, await self._translate_batch(subset, context, all_batches, bi, draft_work)):
+                    drafts[i] = draft
 
-            if self.s.quality == "best" and not all(finals):
+            pending = [i for i, text in enumerate(finals) if not text]
+            if self.s.quality == "best" and self.s.review_scope == "flagged":
+                for i in pending:
+                    row = self.store.segment(self.job_id, batch[i].id)
+                    if row and not row["flags"]:
+                        self.store.save_final(self.job_id, batch[i].id, drafts[i])
+                        finals[i] = drafts[i]
+                pending = [i for i in pending if not finals[i]]
+            if self.s.quality == "best" and pending:
                 self.phase = "reviewing"
                 await self._report()
+                subset = [batch[i] for i in pending]
+                src_tok = sum(estimate_tokens(seg.source) for seg in subset)
                 review_work = Work(SYSTEM_OVERHEAD + 250 + src_tok * (1 + ratio), src_tok * ratio * 1.1)
-                finals = await self._review_batch(batch, drafts, context, review_work)
+                reviewed = await self._review_batch(subset, [drafts[i] for i in pending], context, review_work)
+                for i, final in zip(pending, reviewed):
+                    finals[i] = final
             elif self.s.quality != "best":
-                finals = drafts
+                for i in pending:
+                    self.store.save_final(self.job_id, batch[i].id, drafts[i])
+                    finals[i] = drafts[i]
 
             context = (context + [(s.plain, placeholders.strip(f)) for s, f in zip(batch, finals)
                                   if s.kind not in ("attr", "meta")])[-CONTEXT_PAIRS:]
@@ -272,8 +313,16 @@ class Pipeline:
             {"role": "user", "content": prompts.translate_user(batch, context, nxt, self.s.src, self.s.tgt)},
         ]
         max_tok = int(sum(estimate_tokens(s.source) for s in batch) * 3 + 400)
+        budget = await self._output_budget(msgs, max_tok)
+        if self.s.context_limit and budget < max_tok and len(batch) > 1:
+            mid = len(batch) // 2
+            first = await self._translate_batch(batch[:mid], context, all_batches, bi, Work(planned.prompt / 2, planned.gen / 2))
+            nearby = (context + [(s.plain, placeholders.strip(t)) for s, t in zip(batch[:mid], first)])[-CONTEXT_PAIRS:]
+            return first + await self._translate_batch(batch[mid:], nearby, all_batches, bi, Work(planned.prompt / 2, planned.gen / 2))
+        if budget < max(64, int(sum(estimate_tokens(s.source) for s in batch) * langs.expansion_ratio(self.s.src, self.s.tgt))):
+            raise UserError("context_small", "the full paragraph and its glossary do not fit in the selected context")
         try:
-            comp = await self._call(msgs, planned, temperature=0.35, max_tokens=max_tok)
+            comp = await self._call(msgs, planned, temperature=0.35, max_tokens=budget)
             outs = parse_segs(comp.text, len(batch))
         except LLMError as e:
             log.warning("batch failed, falling back to single segments: %s", e)
@@ -301,7 +350,10 @@ class Pipeline:
             ]
             self._check_stop()
             try:
-                comp = await self.client.chat(msgs, temperature=temp, max_tokens=estimate_tokens(seg.source) * 3 + 200)
+                budget = await self._output_budget(msgs, estimate_tokens(seg.source) * 3 + 200)
+                if budget < 64:
+                    break
+                comp = await self.client.chat(msgs, temperature=temp, max_tokens=budget)
             except LLMError:
                 continue
             cand = parse_segs(comp.text, 1)[0] or comp.text.strip()
@@ -313,9 +365,9 @@ class Pipeline:
         if best is None:
             best, best_problems = seg.source, ["translation failed; source kept"]
         elif placeholders.check(seg.source, best):
-            # Last resort: keep the words, drop inline formatting for this segment.
-            best = placeholders.strip(best)
-            best_problems = [p for p in best_problems if "marker" not in p] + ["inline formatting dropped"]
+            # Links, images and formatting are part of the original segment.
+            best = seg.source
+            best_problems = [*best_problems, "original kept to protect inline layout"]
         return best, best_problems
 
     async def _review_batch(self, batch, drafts, context, planned: Work) -> list[str]:
@@ -325,8 +377,16 @@ class Pipeline:
             {"role": "user", "content": prompts.review_user(batch, drafts, context, self.s.src, self.s.tgt)},
         ]
         max_tok = int(sum(estimate_tokens(d) for d in drafts) * 1.6 + 400)
+        budget = await self._output_budget(msgs, max_tok)
+        if self.s.context_limit and budget < max_tok and len(batch) > 1:
+            mid = len(batch) // 2
+            half = Work(planned.prompt / 2, planned.gen / 2)
+            return (await self._review_batch(batch[:mid], drafts[:mid], context, half)
+                    + await self._review_batch(batch[mid:], drafts[mid:], context, half))
         try:
-            comp = await self._call(msgs, planned, temperature=0.2, max_tokens=max_tok)
+            if budget < max(64, sum(estimate_tokens(d) for d in drafts)):
+                raise UserError("context_small", "the paragraph and draft do not fit for editorial review")
+            comp = await self._call(msgs, planned, temperature=0.2, max_tokens=budget)
             outs = parse_segs(comp.text, len(batch))
         except LLMError as e:
             log.warning("review failed, keeping drafts: %s", e)
@@ -346,8 +406,15 @@ class Pipeline:
         segs = [Segment(id=str(i), chapter=0, kind="para", source=t) for i, t in enumerate(texts)]
         out: list[str] = []
         context: list[tuple[str, str]] = []
-        for b in batches(segs):
+        for b in self._batches(segs):
             res = await self._translate_batch(b, context, [b], 0, Work())
+            if self.s.quality == "best":
+                selected = [i for i, (s, result) in enumerate(zip(b, res)) if self.s.review_scope == "full"
+                            or validators.validate(s.source, result, self.s.src, self.s.tgt)]
+                if selected:
+                    reviewed = await self._review_batch([b[i] for i in selected], [res[i] for i in selected], context, Work())
+                    for i, text in zip(selected, reviewed):
+                        res[i] = text
             out.extend(res)
             context = (context + list(zip([s.plain for s in b], res)))[-CONTEXT_PAIRS:]
         return out

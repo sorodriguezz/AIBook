@@ -10,7 +10,7 @@ import sys
 
 import httpx
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from ..errors import UserError
@@ -26,6 +26,18 @@ class ServerConfig:
     gpu_layers: int = 999  # llama.cpp clamps to the real layer count
     threads: int | None = None
     flash_attn: bool = True
+    cache_ram_mb: int | None = None
+    batch_size: int | None = None
+    micro_batch_size: int | None = None
+    kv_cache: str | None = None
+
+    @classmethod
+    def from_options(cls, options: dict) -> "ServerConfig":
+        config = {field.name: options[field.name] for field in fields(cls) if field.name in options}
+        if options.get("low_memory"):
+            for key, value in (("cache_ram_mb", 128), ("batch_size", 256), ("micro_batch_size", 64)):
+                config.setdefault(key, value)
+        return cls(**config)
 
 
 def _free_port() -> int:
@@ -94,6 +106,12 @@ class LlamaServerManager:
                 args += ["-fa", "auto"]
             if config.threads:
                 args += ["-t", str(config.threads)]
+            for flag, value in (("--cache-ram", config.cache_ram_mb), ("--batch-size", config.batch_size),
+                                ("--ubatch-size", config.micro_batch_size)):
+                if value is not None:
+                    args.extend((flag, str(value)))
+            if config.kv_cache and config.kv_cache != "f16":
+                args.extend(("--cache-type-k", config.kv_cache, "--cache-type-v", config.kv_cache))
             log.info("starting llama-server: %s", " ".join(args))
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             self._proc = subprocess.Popen(
@@ -109,7 +127,11 @@ class LlamaServerManager:
             self.config = config
             self._gen_sample, self.gen_tps = None, None
             self.client = LLMClient(self.base_url, on_use=self._on_use)
-            await self._wait_healthy()
+            try:
+                await self._wait_healthy()
+            except (Exception, asyncio.CancelledError):
+                await self._stop_locked()
+                raise
             self.loaded_at = time.time()
             self.touch()
             return self.client
@@ -171,7 +193,8 @@ class LlamaServerManager:
         while loop.time() < deadline:
             if not self.running:
                 tail = "\n".join(self.log_tail[-15:])
-                raise UserError("model_load_failed", f"llama-server exited while loading the model:\n{tail}", 500)
+                code = "model_memory" if memory_failure(tail) else "model_load_failed"
+                raise UserError(code, f"llama-server exited while loading the model:\n{tail}", 500)
             if await self.client.health():
                 return
             await asyncio.sleep(0.5)
@@ -196,3 +219,9 @@ class LlamaServerManager:
         self.port = None
         self.loaded_at = None
         self.active_requests = 0
+
+
+def memory_failure(message: str) -> bool:
+    return any(term in message.lower() for term in (
+        "out of memory", "out_of_device_memory", "out_of_host_memory", "failed to allocate", "cannot allocate memory",
+    ))
