@@ -50,7 +50,7 @@ class ReleasePlanTests(unittest.TestCase):
             self.plan(releases=[{"tag_name": "v0.3.0", "draft": False}])
 
     def test_versions_are_compared_numerically(self):
-        self.assertTrue(self.plan(version="0.1.10", releases=[
+        self.assertTrue(self.plan(version="0.1.11", releases=[
             {"tag_name": "v0.1.9", "draft": False}])["publish"])
 
 
@@ -81,8 +81,8 @@ class VersionTests(unittest.TestCase):
             with self.subTest(nested=nested, pointer=pointer, engine=engine), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 app = self.fixture(root, nested, pointer, engine)
-                set_version("0.1.10", root)
-                self.assertEqual(check(root), "0.1.10")
+                set_version("0.1.11", root)
+                self.assertEqual(check(root), "0.1.11")
                 cargo = (app / "src-tauri/Cargo.lock").read_text()
                 self.assertIn('name = "dependency"\nversion = "9.8.7"', cargo)
                 lock = json.loads((app / "package-lock.json").read_text())
@@ -94,7 +94,7 @@ class VersionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.fixture(root)
-            (root / "package.json").write_text('{"version":"0.1.10"}')
+            (root / "package.json").write_text('{"version":"0.1.11"}')
             with self.assertRaisesRegex(ValueError, "Versions differ"):
                 check(root)
 
